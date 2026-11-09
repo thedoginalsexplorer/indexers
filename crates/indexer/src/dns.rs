@@ -828,7 +828,7 @@ fn is_envelope_redeem(script: &[u8]) -> bool {
 
 fn spends_envelope(script_sig_hex: Option<&str>) -> bool {
   let Some(bytes) = script_sig_hex.and_then(|h| hex::decode(h).ok()) else { return false };
-  decode_push_datas(&bytes).and_then(|p| p.last().map(|r| is_envelope_redeem(r))).unwrap_or(false)
+  decode_push_datas_lenient(&bytes).and_then(|p| p.last().map(|r| is_envelope_redeem(r))).unwrap_or(false)
 }
 
 const MAX_TRACE_STEPS: usize = 5_000;

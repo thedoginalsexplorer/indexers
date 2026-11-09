@@ -29,9 +29,16 @@ use crate::store::Batch;
 use std::io::BufRead;
 
 const DONE_KEY: &[u8] = b"inscription_renumber_v1";
-/// The second correction (see `run_fix`).
-const FIX_DIR: &str = "renumber2";
-const FIX_DONE_KEY: &[u8] = b"inscription_renumber_fix_v2";
+/// Later corrections, run once each in this order after the renumber (see
+/// `run_fix`): the plan's directory in the data directory, and its done key.
+const FIXES: &[(&str, &[u8])] = &[
+  // The three found by checking numbers (two made on a sat that already
+  // carried an inscription, one taken out by mistake).
+  ("renumber2", b"inscription_renumber_fix_v2"),
+  // Reveals ord-dogecoin's push reading makes nothing of (see
+  // `decode_push_datas`), found by `classify_push_reading`.
+  ("renumber3", b"inscription_renumber_fix_v3"),
+];
 
 fn lines(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
   let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -280,15 +287,19 @@ pub(crate) fn rebuild_dogemaps(db: &store::Db) -> Result<u64> {
 /// later fix plan is waiting.
 pub fn renumber_done(config: &Config) -> Result<bool> {
   let meta = open_db(&config.db_path())?.open_tree("meta")?;
-  Ok(meta.get(DONE_KEY)?.is_some() && !fix_pending(config, &meta)?)
+  if meta.get(DONE_KEY)?.is_none() {
+    return Ok(false);
+  }
+  for (dir, key) in FIXES {
+    if fix_pending(config, &meta, dir, key)? {
+      return Ok(false);
+    }
+  }
+  Ok(true)
 }
 
-fn fix_dir(config: &Config) -> std::path::PathBuf {
-  std::path::Path::new(&config.data_dir).join(FIX_DIR)
-}
-
-fn fix_pending(config: &Config, meta: &store::Tree) -> Result<bool> {
-  Ok(fix_dir(config).join("remove.tsv").exists() && meta.get(FIX_DONE_KEY)?.is_none())
+fn fix_pending(config: &Config, meta: &store::Tree, dir: &str, key: &[u8]) -> Result<bool> {
+  Ok(std::path::Path::new(&config.data_dir).join(dir).join("remove.tsv").exists() && meta.get(key)?.is_none())
 }
 
 /// The one-off correction and renumber; see the module notes. Does nothing
@@ -297,8 +308,12 @@ fn fix_pending(config: &Config, meta: &store::Tree) -> Result<bool> {
 pub async fn run_renumber(config: Config) -> Result<()> {
   run_first(config.clone()).await?;
   let meta = open_db(&config.db_path())?.open_tree("meta")?;
-  if meta.get(DONE_KEY)?.is_some() && fix_pending(&config, &meta)? {
-    run_fix(config).await?;
+  if meta.get(DONE_KEY)?.is_some() {
+    for (dir, key) in FIXES {
+      if fix_pending(&config, &meta, dir, key)? {
+        run_fix(config.clone(), dir, key).await?;
+      }
+    }
   }
   Ok(())
 }
@@ -316,8 +331,11 @@ pub async fn run_renumber(config: Config) -> Result<()> {
 ///
 /// Then numbers and DNS are cleared, as by the renumber. Neither list holds
 /// a dogemap claim, so dogemaps stay as they are.
-async fn run_fix(config: Config) -> Result<()> {
-  let dir = fix_dir(&config);
+///
+/// `renumber3/` has only `remove.tsv`: reveals that made an inscription here
+/// but none in ord-dogecoin, which cannot read their pushes over 255 bytes.
+async fn run_fix(config: Config, name: &'static str, key: &'static [u8]) -> Result<()> {
+  let dir = std::path::Path::new(&config.data_dir).join(name);
   let remove: Vec<(String, u64, u32)> = lines(&dir.join("remove.tsv"))?
     .iter()
     .map(|r| Ok((r[0].clone(), num(r, 1)?, num(r, 2)?)))
@@ -327,18 +345,18 @@ async fn run_fix(config: Config) -> Result<()> {
   } else {
     Vec::new()
   };
-  info!("renumber fix: plan read: {} inscriptions to remove, {} to restore", remove.len(), restore.len());
+  info!("renumber fix {name}: plan read: {} inscriptions to remove, {} to restore", remove.len(), restore.len());
   // Each one restored must still sit where the repair placed it.
   let db = open_db(&config.db_path())?;
   let client = indexer_rpc_client()?;
   for id in &restore {
     match repair::recovered_place(&db, id)? {
-      None => bail!("renumber fix: {id} was never recovered by the repair, so there is nothing to restore"),
+      None => bail!("renumber fix {name}: {id} was never recovered by the repair, so there is nothing to restore"),
       Some(None) => {}
       Some(Some((txid, vout))) => {
         let out: Option<serde_json::Value> = rpc_call(client, &config, "gettxout", serde_json::json!([txid, vout, false])).await?;
         if out.is_none() {
-          bail!("renumber fix: {id} was at {txid}:{vout}, which has been spent since; where it is now is not known");
+          bail!("renumber fix {name}: {id} was at {txid}:{vout}, which has been spent since; where it is now is not known");
         }
       }
     }
@@ -354,14 +372,14 @@ async fn run_fix(config: Config) -> Result<()> {
       for id in &restore {
         restored += repair::restore_recovered(&cfg, &db, id)? as u64;
       }
-      info!("renumber fix: removed {removed}, restored {restored} ({:.0?})", started.elapsed());
+      info!("renumber fix {name}: removed {removed}, restored {restored} ({:.0?})", started.elapsed());
     }
     ii::reset_numbering(&db)?;
     dns::reset(&db)?;
     let meta = db.open_tree("meta")?;
-    meta.insert(FIX_DONE_KEY, encode_u64(1).to_vec())?;
+    meta.insert(key, encode_u64(1).to_vec())?;
     db.flush()?;
-    info!("renumber fix: numbers and DNS cleared; numbering starts again from the first inscription ({:.0?})", started.elapsed());
+    info!("renumber fix {name}: numbers and DNS cleared; numbering starts again from the first inscription ({:.0?})", started.elapsed());
     Ok(())
   })
   .await
@@ -457,6 +475,202 @@ mod tests {
     let list: Vec<(u64, String)> = bincode::deserialize(by_outpoint.get("cc:0").unwrap().unwrap().as_ref()).unwrap();
     assert_eq!(list, vec![(0, old.clone())]);
     assert!(seq.get(ii::seq_key(100, 4)).unwrap().is_none() && seq.get(ii::seq_key(100, 5)).unwrap().is_some());
+  }
+
+  /// Replays every reveal from the start height with the push reading the
+  /// index used until now (correct lengths) and with ord-dogecoin's (see
+  /// `decode_push_datas`), and writes what changes, for `renumber3/`:
+  ///  - `remove.tsv`: id, height, position: completed before, not now.
+  ///  - `add.tsv`: id, height, position: completed now, not before.
+  ///  - `moved.tsv`: id, old height, old position, new height, new position.
+  ///  - `unblock.tsv`: txid, height, position, removed id: a transaction that
+  ///    carries a removed inscription in at offset 0 and is a reveal by
+  ///    ord-dogecoin's reading. The index skipped it for the inscription
+  ///    already there; without it, ord-dogecoin may make one. Checked by hand.
+  /// Both readings use the same chain rule as the live indexer. Reads only
+  /// the node. Skipped by default: `PLAN_OUT=<dir> [FROM=] [TO=] cargo test
+  /// -p dogeord-indexer classify_push_reading -- --ignored --nocapture`
+  #[tokio::test(flavor = "multi_thread")]
+  #[ignore]
+  async fn classify_push_reading() {
+    use std::io::Write;
+    let config = Config::from_env();
+    let client = indexer_rpc_client().unwrap();
+    let from: u64 = std::env::var("FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(config.first_inscription_height);
+    let to: u64 = match std::env::var("TO").ok().and_then(|v| v.parse().ok()) {
+      Some(t) => t,
+      None => rpc_call::<u64>(client, &config, "getblockcount", serde_json::json!([])).await.unwrap(),
+    };
+    let dir = std::path::PathBuf::from(std::env::var("PLAN_OUT").expect("PLAN_OUT"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |n: &str| std::io::BufWriter::new(std::fs::File::create(dir.join(n)).unwrap());
+    let (mut remove_f, mut add_f, mut moved_f, mut unblock_f) = (file("remove.tsv"), file("add.tsv"), file("moved.tsv"), file("unblock.tsv"));
+    type Decode = fn(&[u8]) -> Option<Vec<Vec<u8>>>;
+    // One reading's reveal chains: the live indexer's rule (a spend that does
+    // not continue a chain leaves it where it was).
+    fn step(chains: &mut HashMap<String, PartialInscriptionChain>, txid: &str, prev: Option<&str>, script: &[u8], decode: Decode) -> Option<String> {
+      let taken = prev.and_then(|p| chains.remove(p));
+      let continues = taken.is_some();
+      let mut chain = taken.unwrap_or_else(|| PartialInscriptionChain { start_txid: txid.to_string(), scripts: Vec::new() });
+      chain.scripts.push(script.to_vec());
+      match crate::parse_inscription_outcome_with(&chain.scripts, decode) {
+        InscriptionParseOutcome::Complete(..) => Some(format!("{}i0", chain.start_txid)),
+        InscriptionParseOutcome::Partial => {
+          chains.insert(txid.to_string(), chain);
+          None
+        }
+        InscriptionParseOutcome::None => {
+          if continues {
+            chain.scripts.pop();
+            chains.insert(prev.unwrap().to_string(), chain);
+          }
+          None
+        }
+      }
+    }
+    let (mut old, mut new): (HashMap<String, PartialInscriptionChain>, HashMap<String, PartialInscriptionChain>) = Default::default();
+    // Where each inscription completed under each reading, until both agree.
+    let (mut old_only, mut new_only): (HashMap<String, (u64, u32)>, HashMap<String, (u64, u32)>) = Default::default();
+    // Removed inscriptions, followed sat by sat: outpoint -> (offset, id).
+    let mut tracked: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    let mut values: HashMap<String, Vec<u64>> = HashMap::new();
+    let (mut both, mut unblocks) = (0u64, 0u64);
+    let started = Instant::now();
+    let mut next = from;
+    while next <= to {
+      let end = (next + 64).min(to + 1);
+      let mut set = tokio::task::JoinSet::new();
+      for h in next..end {
+        let cfg = config.clone();
+        set.spawn(async move {
+          // Rides out a node restart: tries again for up to an hour.
+          for attempt in 0.. {
+            match repair::fetch_block(client, &cfg, h).await {
+              Ok(b) => return (h, b),
+              Err(e) if attempt < 360 => {
+                if attempt % 6 == 0 {
+                  println!("block {h}: {e:#}; trying again");
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+              }
+              Err(e) => panic!("block {h}: {e:#}"),
+            }
+          }
+          unreachable!()
+        });
+      }
+      let mut blocks = Vec::new();
+      while let Some(r) = set.join_next().await {
+        blocks.push(r.unwrap());
+      }
+      blocks.sort_by_key(|(h, _)| *h);
+      for (h, block) in &blocks {
+        for (i, tx) in block.tx.iter().enumerate() {
+          let i = i as u32;
+          let prep = prepare_tx(tx).unwrap();
+          // Removed inscriptions this transaction spends move on.
+          let mut carried: Vec<(u64, String)> = Vec::new();
+          if prep.vin_outpoints.iter().flatten().any(|o| tracked.contains_key(o)) {
+            let mut input_value = 0u64;
+            for (k, vin) in tx.vin.iter().enumerate() {
+              let (Some(ptxid), Some(pvout)) = (&vin.txid, vin.vout) else { continue };
+              if let Some(ids) = prep.vin_outpoints[k].as_deref().and_then(|o| tracked.remove(o)) {
+                carried.extend(ids.into_iter().map(|(o, id)| (input_value + o, id)));
+              }
+              input_value += loop {
+                match repair::prev_value(client, &config, &mut values, ptxid, pvout).await {
+                  Ok(v) => break v,
+                  Err(e) => {
+                    println!("{ptxid}:{pvout}: {e:#}; trying again");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                  }
+                }
+              };
+            }
+          }
+          let Some(script) = prep.script_sig.as_deref() else {
+            continue;
+          };
+          let prev = tx.vin.first().and_then(|v| v.txid.as_deref());
+          let o = step(&mut old, &tx.txid, prev, script, crate::decode_push_datas_lenient);
+          let n = step(&mut new, &tx.txid, prev, script, crate::decode_push_datas);
+          // A removed inscription at offset 0 of a transaction ord-dogecoin
+          // reads as a reveal (or a step of one).
+          let ord_reveal = n.is_some() || new.contains_key(&tx.txid) || crate::decode_push_datas(script).is_some_and(|p| p.first().is_some_and(|f| f.as_slice() == b"ord"));
+          if let Some((_, id)) = carried.iter().find(|(o, _)| *o == 0)
+            && ord_reveal
+          {
+            writeln!(unblock_f, "{}\t{h}\t{i}\t{id}", tx.txid).unwrap();
+            unblocks += 1;
+          }
+          match (&o, &n) {
+            (Some(a), Some(b)) if a == b => both += 1,
+            _ => {
+              if let Some(a) = &o {
+                match new_only.remove(a) {
+                  Some((nh, ni)) => writeln!(moved_f, "{a}\t{h}\t{i}\t{nh}\t{ni}").unwrap(),
+                  None => {
+                    old_only.insert(a.clone(), (*h, i));
+                  }
+                }
+              }
+              if let Some(b) = &n {
+                match old_only.remove(b) {
+                  Some((oh, oi)) => writeln!(moved_f, "{b}\t{oh}\t{oi}\t{h}\t{i}").unwrap(),
+                  None => {
+                    new_only.insert(b.clone(), (*h, i));
+                  }
+                }
+              }
+              // A new inscription that will be removed sits on offset 0 of
+              // this transaction's outputs: follow it.
+              if let Some(a) = &o
+                && n.as_ref() != Some(a)
+              {
+                carried.push((0, a.clone()));
+              }
+            }
+          }
+          if carried.is_empty() {
+            continue;
+          }
+          let mut start = 0u64;
+          for out in &prep.outs {
+            let end = start + out.satoshis;
+            for (abs, id) in &carried {
+              if *abs >= start && *abs < end {
+                tracked.entry(out.outpoint.clone()).or_default().push((abs - start, id.clone()));
+              }
+            }
+            start = end;
+          }
+        }
+        if h % 10_000 == 0 {
+          println!(
+            "block {h}: {both} read the same, {} only before, {} only now, {unblocks} to check, {:.0?}",
+            old_only.len(),
+            new_only.len(),
+            started.elapsed()
+          );
+        }
+      }
+      next = end;
+    }
+    for (id, (h, i)) in &old_only {
+      writeln!(remove_f, "{id}\t{h}\t{i}").unwrap();
+    }
+    for (id, (h, i)) in &new_only {
+      writeln!(add_f, "{id}\t{h}\t{i}").unwrap();
+    }
+    for f in [&mut remove_f, &mut add_f, &mut moved_f, &mut unblock_f] {
+      f.flush().unwrap();
+    }
+    println!(
+      "done {from}..={to}: {both} read the same, {} to remove, {} to add, {unblocks} to check, {:.0?}",
+      old_only.len(),
+      new_only.len(),
+      started.elapsed()
+    );
   }
 
   #[test]

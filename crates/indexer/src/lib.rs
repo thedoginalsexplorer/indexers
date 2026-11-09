@@ -3072,10 +3072,16 @@ fn process_inscription_candidate(
 }
 
 fn parse_inscription_outcome(scripts: &[Vec<u8>]) -> InscriptionParseOutcome {
+  parse_inscription_outcome_with(scripts, decode_push_datas)
+}
+
+/// The envelope parse with a given way of reading pushes (the replay that
+/// finds what ord-dogecoin's push reading changes compares two).
+pub(crate) fn parse_inscription_outcome_with(scripts: &[Vec<u8>], decode: fn(&[u8]) -> Option<Vec<Vec<u8>>>) -> InscriptionParseOutcome {
   let Some(first) = scripts.first() else {
     return InscriptionParseOutcome::None;
   };
-  let Some(mut push_datas) = decode_push_datas(first) else {
+  let Some(mut push_datas) = decode(first) else {
     return InscriptionParseOutcome::None;
   };
 
@@ -3123,7 +3129,7 @@ fn parse_inscription_outcome(scripts: &[Vec<u8>]) -> InscriptionParseOutcome {
       return InscriptionParseOutcome::Partial;
     }
 
-    let Some(next_script_pushes) = decode_push_datas(&scripts[script_idx]) else {
+    let Some(next_script_pushes) = decode(&scripts[script_idx]) else {
       return InscriptionParseOutcome::None;
     };
     push_datas = next_script_pushes;
@@ -3140,7 +3146,52 @@ fn parse_inscription_outcome(scripts: &[Vec<u8>]) -> InscriptionParseOutcome {
   }
 }
 
+/// Script pushes as ord-dogecoin reads an inscription envelope, quirks included,
+/// so the same reveals make inscriptions here as there (and on doginals.org):
+/// OP_PUSHDATA2 and OP_PUSHDATA4 lengths are built with the opcode byte as
+/// the low byte and the top length byte dropped (`(b[1] << 8) + b[0]`), so a
+/// push over 255 bytes normally does not decode; and any opcode that is not
+/// a push makes the whole script undecodable.
 fn decode_push_datas(script: &[u8]) -> Option<Vec<Vec<u8>>> {
+  let mut bytes = script;
+  let mut push_datas = Vec::new();
+  while !bytes.is_empty() {
+    let op = bytes[0];
+    let (len, skip) = match op {
+      0 => (0, 1),
+      81..=96 => {
+        push_datas.push(vec![op - 80]);
+        bytes = &bytes[1..];
+        continue;
+      }
+      1..=75 => (usize::from(op), 1),
+      76 => (usize::from(*bytes.get(1)?), 2),
+      77 => {
+        if bytes.len() < 3 {
+          return None;
+        }
+        ((usize::from(bytes[1]) << 8) + usize::from(bytes[0]), 3)
+      }
+      78 => {
+        if bytes.len() < 5 {
+          return None;
+        }
+        ((usize::from(bytes[3]) << 24) + (usize::from(bytes[2]) << 16) + (usize::from(bytes[1]) << 8) + usize::from(bytes[0]), 5)
+      }
+      _ => return None,
+    };
+    if bytes.len() < skip + len {
+      return None;
+    }
+    push_datas.push(bytes[skip..skip + len].to_vec());
+    bytes = &bytes[skip + len..];
+  }
+  Some(push_datas)
+}
+
+/// Script pushes decoded correctly, stopping at a trailing non-push opcode.
+/// Not for inscription envelopes (see `decode_push_datas`).
+pub(crate) fn decode_push_datas_lenient(script: &[u8]) -> Option<Vec<Vec<u8>>> {
   let mut bytes = script;
   let mut push_datas = Vec::new();
 
@@ -5456,7 +5507,7 @@ mod tests {
         b"abc",
         b"junk-signature-push",
       ],
-      Some(0x75), // OP_DROP
+      None
     );
     let script1 = script_from_pushes(
       &[
@@ -5464,7 +5515,7 @@ mod tests {
         b"def",
         b"junk-pubkey-push",
       ],
-      Some(0x75), // OP_DROP
+      None
     );
 
     match parse_inscription_outcome(&[script0, script1]) {
@@ -5475,6 +5526,52 @@ mod tests {
       }
       _ => panic!("expected complete inscription parse"),
     }
+    // As ord-dogecoin: a script with an opcode that is not a push does not
+    // decode, so it makes no inscription.
+    let with_op = script_from_pushes(&[b"ord", &[1], b"text/plain", &[0], b"x"], Some(0x75));
+    assert!(matches!(parse_inscription_outcome(&[with_op]), InscriptionParseOutcome::None));
+  }
+
+  /// A one-piece envelope whose body is a single push of `n` bytes, written
+  /// with OP_PUSHDATA1 or OP_PUSHDATA2 as a wallet would.
+  fn one_piece_with_body(n: usize) -> Vec<u8> {
+    let mut s = script_from_pushes(&[b"ord", &[1], b"image/png", &[0]], None);
+    if n <= 255 {
+      s.extend_from_slice(&[0x4c, n as u8]);
+    } else {
+      s.push(0x4d);
+      s.extend_from_slice(&(n as u16).to_le_bytes());
+    }
+    s.extend(std::iter::repeat_n(0xab, n));
+    s.extend_from_slice(&push(b"signature"));
+    s
+  }
+
+  #[test]
+  fn pushes_are_read_as_ord_dogecoin_reads_them() {
+    // Up to 255 bytes (OP_PUSHDATA1): an inscription, read the same either way.
+    let ok = one_piece_with_body(240);
+    assert!(matches!(parse_inscription_outcome(&[ok.clone()]), InscriptionParseOutcome::Complete(_, b, _) if b.len() == 240));
+    assert_eq!(decode_push_datas(&ok), decode_push_datas_lenient(&ok));
+    // Over 255 (OP_PUSHDATA2): ord-dogecoin's length is (low byte << 8) + 0x4d,
+    // past the end of the script, so the reveal makes no inscription; read
+    // correctly it would (as 306- and 520-byte pushes on mainnet).
+    for n in [306, 472, 520] {
+      let s = one_piece_with_body(n);
+      assert!(decode_push_datas(&s).is_none(), "{n}");
+      assert!(matches!(parse_inscription_outcome(&[s.clone()]), InscriptionParseOutcome::None), "{n}");
+      assert!(
+        matches!(parse_inscription_outcome_with(&[s], decode_push_datas_lenient), InscriptionParseOutcome::Complete(_, b, _) if b.len() == n),
+        "{n}"
+      );
+    }
+    // A 256-byte push: low byte 0, so ord-dogecoin reads 77 bytes and goes on
+    // from the middle of the body, exactly as here.
+    let mut s = vec![0x4d, 0x00, 0x01];
+    s.extend(std::iter::repeat_n(0x01, 77));
+    s.extend_from_slice(&[0x02, 0xaa, 0xbb]);
+    let p = decode_push_datas(&s).unwrap();
+    assert_eq!((p.len(), p[0].len(), p[1].as_slice()), (2, 77, &[0xaa, 0xbb][..]));
   }
 
   #[test]
@@ -5579,25 +5676,25 @@ mod tests {
       process_inscription_candidate(t, decode_script_sig_bytes(t).as_deref(), &partial, undo).unwrap()
     };
 
-    let a = tx("txa", "funding", script_from_pushes(&[b"ord", &[3], b"image/webp", &[2], b"aa"], Some(0x75)));
+    let a = tx("txa", "funding", script_from_pushes(&[b"ord", &[3], b"image/webp", &[2], b"aa"], None));
     assert!(run(&a, &mut undo).is_none());
     // A plain signature-and-key spend of txa's change: not a continuation.
     let pay = tx("txpay", "txa", script_from_pushes(&[b"signature-bytes-here", b"public-key-bytes"], None));
     assert!(run(&pay, &mut undo).is_none());
     assert!(partial.get("txa".as_bytes()).unwrap().is_some(), "the chain is still waiting for its next piece");
     // The real next piece, then the last.
-    let b = tx("txb", "txa", script_from_pushes(&[&[1], b"bb"], Some(0x75)));
+    let b = tx("txb", "txa", script_from_pushes(&[&[1], b"bb"], None));
     assert!(run(&b, &mut undo).is_none());
     assert!(partial.get("txa".as_bytes()).unwrap().is_none() && partial.get("txb".as_bytes()).unwrap().is_some());
-    let c = tx("txc", "txb", script_from_pushes(&[&[0], b"cc"], Some(0x75)));
+    let c = tx("txc", "txb", script_from_pushes(&[&[0], b"cc"], None));
     let done = run(&c, &mut undo).expect("complete");
     assert_eq!((done.inscription_txid.as_str(), done.content_type.as_str(), done.body.as_slice()), ("txa", "image/webp", &b"aabbcc"[..]));
     assert!(partial.get("txb".as_bytes()).unwrap().is_none());
 
     // A piece that does not follow the countdown also leaves the chain.
-    let d = tx("txd", "funding2", script_from_pushes(&[b"ord", &[2], b"text/plain", &[1], b"d1"], Some(0x75)));
+    let d = tx("txd", "funding2", script_from_pushes(&[b"ord", &[2], b"text/plain", &[1], b"d1"], None));
     assert!(run(&d, &mut undo).is_none());
-    let wrong = tx("txw", "txd", script_from_pushes(&[&[5], b"zz"], Some(0x75)));
+    let wrong = tx("txw", "txd", script_from_pushes(&[&[5], b"zz"], None));
     assert!(run(&wrong, &mut undo).is_none());
     assert!(partial.get("txd".as_bytes()).unwrap().is_some());
   }
@@ -5616,7 +5713,7 @@ mod tests {
         &[1],
         b"abc",
       ],
-      Some(0x75),
+      None,
     );
     let tx0 = RpcTx {
       txid: "tx0".to_string(),
@@ -5641,7 +5738,7 @@ mod tests {
         &[0],
         b"def",
       ],
-      Some(0x75),
+      None,
     );
     let tx1 = RpcTx {
       txid: "tx1".to_string(),
