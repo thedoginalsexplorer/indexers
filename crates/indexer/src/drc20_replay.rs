@@ -17,14 +17,81 @@
 //! The rebuilt state goes into its own trees (`drc20r_*`) while the site
 //! keeps serving the old one. When the replay reaches the live tip, the two
 //! are swapped between two live blocks, after checking the replayed blocks
-//! are still the chain. A restart before then starts it over.
+//! are still the chain.
+//!
+//! When the service stops, the replay finishes the block it is on and saves
+//! where it is (`RESUME_KEY`); the next start carries on from there. The
+//! saved place is taken back as soon as the replay resumes, so after a crash,
+//! when the rebuilt trees may be past any saved place, it starts over.
 
 use super::*;
 use crate::insc_index::SeqEntry;
 use crate::store::Batch;
+use std::sync::atomic::AtomicBool;
 use tokio::task::JoinSet;
 
-const STATE_KEY: &[u8] = b"drc20_replay_v1";
+/// v2: transfer inscriptions spent as fee go back to their sender (v1 left
+/// them locked). A new key makes the replay run again on the next start.
+/// v3: deploys over u64::MAX whole tokens are invalid, and ticks match
+/// without regard to Unicode case (BOOB had kept an invalid first deploy).
+const STATE_KEY: &[u8] = b"drc20_replay_v3";
+/// Done marks of earlier replays. Their figures are close enough to keep
+/// serving while a later replay runs (v3 changes 10 of 71,763 tokens).
+const SERVABLE_KEYS: [&[u8]; 1] = [b"drc20_replay_v2"];
+const RESUME_KEY: &[u8] = b"drc20_replay_resume";
+
+/// Set by `pause_drc20_replay`; the replay sees it between two blocks.
+static STOP: AtomicBool = AtomicBool::new(false);
+/// Set once the replay is at rest: place saved, or not running.
+static AT_REST: AtomicBool = AtomicBool::new(true);
+/// Set once the replay is known to be done, so callers stop reading meta.
+static DONE: AtomicBool = AtomicBool::new(false);
+/// Where the replay is, for the API: first block, next block, live tip.
+static FROM: AtomicU64 = AtomicU64::new(0);
+static HEIGHT: AtomicU64 = AtomicU64::new(0);
+static TARGET: AtomicU64 = AtomicU64::new(0);
+
+/// How far the replay has got: (first block, next block to replay, live tip).
+/// All zero until it has started this run.
+pub fn drc20_replay_progress() -> (u64, u64, u64) {
+  (FROM.load(AtomicOrdering::Relaxed), HEIGHT.load(AtomicOrdering::Relaxed), TARGET.load(AtomicOrdering::Relaxed))
+}
+
+/// As `drc20_replay_done`, without a read once it is true.
+pub fn drc20_replay_done_cached(config: &Config) -> Result<bool> {
+  if DONE.load(AtomicOrdering::Relaxed) {
+    return Ok(true);
+  }
+  let done = drc20_replay_done(config)?;
+  if done {
+    DONE.store(true, AtomicOrdering::Relaxed);
+  }
+  Ok(done)
+}
+
+/// Where a paused replay was: everything it keeps outside its trees.
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+  next: u64,
+  tracked: HashMap<String, Vec<(u64, String)>>,
+  recent: VecDeque<(u64, String)>,
+  created: u64,
+  settled: u64,
+}
+
+/// For shutdown: has the replay save its place after the block it is on, and
+/// waits (up to `wait`) for it to. Returns whether it is at rest.
+pub async fn pause_drc20_replay(wait: Duration) -> bool {
+  STOP.store(true, AtomicOrdering::SeqCst);
+  let until = Instant::now() + wait;
+  while !AT_REST.load(AtomicOrdering::SeqCst) {
+    if Instant::now() >= until {
+      return false;
+    }
+    sleep(Duration::from_millis(50)).await;
+  }
+  true
+}
 const AHEAD: u64 = 32;
 
 /// (live tree, rebuilt tree)
@@ -41,6 +108,26 @@ const ACTIVITY_END: &[u8] = b"T}";
 
 pub fn drc20_replay_done(config: &Config) -> Result<bool> {
   Ok(open_db(&config.db_path())?.open_tree("meta")?.get(STATE_KEY)?.is_some())
+}
+
+/// Whether DRC-20 figures may be served: the current replay is done, or an
+/// earlier one is (see `SERVABLE_KEYS`) and the current one only refines it.
+pub fn drc20_servable_cached(config: &Config) -> Result<bool> {
+  if drc20_replay_done_cached(config)? {
+    return Ok(true);
+  }
+  static SERVABLE: AtomicBool = AtomicBool::new(false);
+  if SERVABLE.load(AtomicOrdering::Relaxed) {
+    return Ok(true);
+  }
+  let meta = open_db(&config.db_path())?.open_tree("meta")?;
+  for key in SERVABLE_KEYS {
+    if meta.get(key)?.is_some() {
+      SERVABLE.store(true, AtomicOrdering::Relaxed);
+      return Ok(true);
+    }
+  }
+  Ok(false)
 }
 
 struct Trees {
@@ -89,6 +176,19 @@ impl Replay {
       created: 0,
       settled: 0,
     })
+  }
+
+  /// Settles a transfer inscription's first move: to `to`, or back to its
+  /// sender when `to` is empty (spent as fee).
+  #[allow(clippy::too_many_arguments)]
+  fn settle(&mut self, undo: &mut UndoRecorder, id: &str, to: &str, tx: &RpcTx, tx_index: usize, height: u64, time: u64) -> Result<()> {
+    let moved = process_drc20_transfer_move_with_undo(&self.t.balance, &self.t.transferable, id, to, Some(undo))?;
+    if let Some(m) = moved {
+      self.settled += 1;
+      let event = ActivityEvent { kind: "transfer".to_string(), amount: m.amount.to_string(), from: m.from, to: m.to, inscription_id: id.to_string(), txid: tx.txid.clone(), height, time };
+      record_activity(&self.t.activity, undo, &drc20_scope(&m.tick), tx_index, &format!("{id}|transfer"), &event)?;
+    }
+    Ok(())
   }
 
   /// Applies one block, as live indexing would have with the corrected
@@ -163,8 +263,17 @@ impl Replay {
           }
           start = end;
         }
-        // Sent to fees: nothing happens, and it never moves again.
-        let Some((vout, offset)) = landed else { continue };
+        let Some((vout, offset)) = landed else {
+          // Spent as fee. A new inscription there is no operation; a transfer
+          // inscription goes back to its sender, as the reference indexers
+          // (and doggy.market) settle it. Leaving it unsettled kept the amount
+          // locked as transferable for good, and every later inscribe of that
+          // address that needed it failed.
+          if let Event::Moved(id) = event {
+            self.settle(&mut undo, &id, "", tx, tx_index, height, time)?;
+          }
+          continue;
+        };
         let out = &prep.outs[vout];
         match event {
           Event::Created(id, action) => {
@@ -190,12 +299,8 @@ impl Replay {
             }
           }
           Event::Moved(id) => {
-            let moved = process_drc20_transfer_move_with_undo(&self.t.balance, &self.t.transferable, &id, &out.address, Some(&mut undo))?;
-            if let Some(m) = moved {
-              self.settled += 1;
-              let event = ActivityEvent { kind: "transfer".to_string(), amount: m.amount.to_string(), from: m.from, to: m.to, inscription_id: id.clone(), txid: tx.txid.clone(), height, time };
-              record_activity(&self.t.activity, &mut undo, &drc20_scope(&m.tick), tx_index, &format!("{id}|transfer"), &event)?;
-            }
+            let to = out.address.clone();
+            self.settle(&mut undo, &id, &to, tx, tx_index, height, time)?;
           }
         }
       }
@@ -209,11 +314,11 @@ impl Replay {
 }
 
 /// Every key of a tree whose keys are text or big-endian numbers.
-fn clear(tree: &store::Tree) -> Result<()> {
+pub(crate) fn clear(tree: &store::Tree) -> Result<()> {
   tree.delete_range(Vec::new(), vec![0xff; 256])
 }
 
-fn copy(db: &store::Db, from: &store::Tree, to: &store::Tree) -> Result<u64> {
+pub(crate) fn copy(db: &store::Db, from: &store::Tree, to: &store::Tree) -> Result<u64> {
   let meta = db.open_tree("meta")?;
   let mut batch = Batch::default();
   let (mut n, mut pending) = (0u64, 0usize);
@@ -275,19 +380,77 @@ pub async fn run_drc20_replay(config: Config) -> Result<()> {
   let db = open_db(&config.db_path())?;
   let meta = db.open_tree("meta")?;
   let blocks = db.open_tree("blocks")?;
-  // Always from the start: the rebuilt trees are not crash-consistent.
-  for (_, rebuilt) in TREES {
-    clear(&db.open_tree(rebuilt)?)?;
-  }
-  clear(&db.open_tree(ACTIVITY)?)?;
   let mut r = Replay::open(&db)?;
   let mut next = config.first_inscription_height;
+  let saved = meta.get(RESUME_KEY)?.map(|v| bincode::deserialize::<Checkpoint>(v.as_ref())).transpose();
+  match saved {
+    Ok(Some(c)) => {
+      // Taken back before anything is written: from here on the trees move
+      // past it, and only a clean stop saves a place again.
+      meta.remove(RESUME_KEY)?;
+      db.flush()?;
+      next = c.next;
+      r.tracked = c.tracked;
+      r.recent = c.recent;
+      r.created = c.created;
+      r.settled = c.settled;
+      info!("drc20 replay: resuming at block {next} where the last stop left it ({} operations so far)", r.created);
+    }
+    other => {
+      if let Err(e) = other {
+        warn!("drc20 replay: saved place unreadable, starting over: {e}");
+        meta.remove(RESUME_KEY)?;
+      }
+      // From the start: without a saved place the rebuilt trees may hold
+      // part of a block.
+      for (_, rebuilt) in TREES {
+        clear(&db.open_tree(rebuilt)?)?;
+      }
+      clear(&db.open_tree(ACTIVITY)?)?;
+      info!("drc20 replay: replaying from block {next}");
+    }
+  }
   let started = Instant::now();
   let mut since_log = 0u64;
-  info!("drc20 replay: replaying from block {next}");
+  FROM.store(config.first_inscription_height, AtomicOrdering::Relaxed);
+  HEIGHT.store(next, AtomicOrdering::Relaxed);
+  AT_REST.store(false, AtomicOrdering::SeqCst);
+  let result = replay_loop(&config, client, &db, &meta, &blocks, &mut r, next, started, &mut since_log).await;
+  AT_REST.store(true, AtomicOrdering::SeqCst);
+  result
+}
 
+/// Saves where the replay is. Only call between two blocks: every block
+/// before `next` is in the trees and none after it.
+fn save_place(db: &store::Db, meta: &store::Tree, r: &mut Replay, next: u64) -> Result<()> {
+  let c = Checkpoint { next, tracked: std::mem::take(&mut r.tracked), recent: r.recent.clone(), created: r.created, settled: r.settled };
+  meta.insert(RESUME_KEY, bincode::serialize(&c)?)?;
+  db.flush()?;
+  info!("drc20 replay: stopped at block {next}, place saved; the next start resumes here");
+  Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replay_loop(
+  config: &Config,
+  client: &'static Client,
+  db: &store::Db,
+  meta: &store::Tree,
+  blocks: &store::Tree,
+  r: &mut Replay,
+  mut next: u64,
+  started: Instant,
+  since_log: &mut u64,
+) -> Result<()> {
+  let config = config.clone();
   loop {
+    if STOP.load(AtomicOrdering::SeqCst) {
+      save_place(db, meta, r, next)?;
+      return Ok(());
+    }
     let live = meta.get(b"indexed_height")?.map(|v| decode_u64(v.as_ref())).transpose()?.unwrap_or(0);
+    HEIGHT.store(next, AtomicOrdering::Relaxed);
+    TARGET.store(live, AtomicOrdering::Relaxed);
     if next > live {
       let swapped = {
         let _w = repair::INDEX_WRITE.lock().unwrap_or_else(|e| e.into_inner());
@@ -305,9 +468,10 @@ pub async fn run_drc20_replay(config: Config) -> Result<()> {
             }
           }
           if same {
-            swap(&db)?;
+            swap(db)?;
             meta.insert(STATE_KEY, encode_u64(1).to_vec())?;
             db.flush()?;
+            DONE.store(true, AtomicOrdering::Relaxed);
           }
           Some(same)
         }
@@ -341,12 +505,16 @@ pub async fn run_drc20_replay(config: Config) -> Result<()> {
     }
     fetched.sort_by_key(|(h, _)| *h);
     for (h, block) in &fetched {
+      if STOP.load(AtomicOrdering::SeqCst) {
+        save_place(db, meta, r, *h)?;
+        return Ok(());
+      }
       r.block(client, &config, *h, block).await?;
     }
-    since_log += fetched.len() as u64;
+    *since_log += fetched.len() as u64;
     next = to;
-    if since_log >= 50_000 {
-      since_log = 0;
+    if *since_log >= 50_000 {
+      *since_log = 0;
       info!(
         "drc20 replay: at block {next}, {} operations, {} transfers settled, {} transfer inscriptions unsent",
         r.created,
@@ -433,6 +601,67 @@ mod tests {
     assert!(r.t.deploy.for_each_prefix(b"", |_, _| Ok(false)).is_ok());
   }
 
+  /// A transfer inscription spent as fee goes back to its sender: the
+  /// amount is no longer locked, and the sender can inscribe it again.
+  #[tokio::test]
+  async fn a_transfer_spent_as_fee_returns_to_its_sender() {
+    let db = store::Db::temporary().unwrap();
+    let seq = db.open_tree("inscription_seq").unwrap();
+    let content = db.open_tree("inscription_content").unwrap();
+    let a = "DALICE";
+    let ops = [
+      (1u32, "d1", r#"{"p":"drc-20","op":"deploy","tick":"dogi","max":"1000","lim":"1000"}"#),
+      (2, "m2", r#"{"p":"drc-20","op":"mint","tick":"dogi","amt":"600"}"#),
+      (3, "t3", r#"{"p":"drc-20","op":"transfer","tick":"dogi","amt":"400"}"#),
+      // The same 400 again, after the first transfer went to fees.
+      (5, "t5", r#"{"p":"drc-20","op":"transfer","tick":"dogi","amt":"400"}"#),
+    ];
+    for (pos, txid, body) in ops {
+      let id = format!("{txid}i0");
+      seq.insert(ii::seq_key(100, pos), ii::seq_value(&id, 0, 1100).unwrap()).unwrap();
+      let c = InscriptionContentRecord { content_type: "text/plain".into(), body: body.as_bytes().to_vec(), delegate: None };
+      content.insert(id.as_bytes(), bincode::serialize(&c).unwrap()).unwrap();
+    }
+    let b100 = block(100, serde_json::json!([
+      tx("c0", &[], &[(50.0, a)]),
+      tx("d1", &[("x0", 0)], &[(0.001, a)]),
+      tx("m2", &[("x1", 0)], &[(0.001, a)]),
+      tx("t3", &[("x2", 0)], &[(0.001, a), (1.0, a)]),
+      // The big coin first, then the inscription; the one output is smaller
+      // than the coin, so the inscription's sat goes to the fee.
+      tx("s4", &[("t3", 1), ("t3", 0)], &[(0.5, a)]),
+      tx("t5", &[("x3", 0)], &[(0.001, a)]),
+    ]));
+    let mut r = Replay::open(&db).unwrap();
+    let config = Config::from_env();
+    let client = indexer_rpc_client().unwrap();
+    r.block(client, &config, 100, &b100).await.unwrap();
+    assert_eq!(r.settled, 1, "the fee spend settles the first transfer");
+    assert_eq!(r.created, 4, "deploy, mint and both transfer-inscribes are valid");
+
+    let raw = r.t.balance.get(b"B|DALICE|dogi").unwrap().map(|v| v.to_vec());
+    let raw = raw.or_else(|| {
+      let mut found = None;
+      r.t.balance.for_each_prefix(b"B|DALICE|", |_, v| { found = Some(v.to_vec()); Ok(false) }).unwrap();
+      found
+    }).expect("Alice's balance");
+    let bal: Drc20Balance = bincode::deserialize(&raw).unwrap();
+    let e18 = 10u128.pow(18);
+    // All 600 still hers; only the second transfer's 400 is locked.
+    assert_eq!((bal.overall, bal.transferable), (600 * e18, 400 * e18));
+    assert!(r.t.transferable.get(b"t3i0").unwrap().is_none());
+    assert!(r.t.transferable.get(b"t5i0").unwrap().is_some());
+    let mut transfers = Vec::new();
+    r.t.activity.for_each_prefix(b"T|", |_, v| {
+      let e = bincode::deserialize::<ActivityEvent>(v)?;
+      if e.kind == "transfer" {
+        transfers.push((e.from, e.to));
+      }
+      Ok(true)
+    }).unwrap();
+    assert_eq!(transfers, [(a.to_string(), a.to_string())]);
+  }
+
   #[test]
   fn swap_replaces_live_drc20_state_and_keeps_dune_activity() {
     let db = store::Db::temporary().unwrap();
@@ -452,5 +681,20 @@ mod tests {
     assert!(activity.get(b"T|dogi|1|old").unwrap().is_none());
     assert!(activity.get(b"T|dogi|1|new").unwrap().is_some());
     assert!(activity.get(b"D|840000:3|1|dune").unwrap().is_some(), "Dune activity stays");
+  }
+
+  #[test]
+  fn a_saved_place_keeps_what_lives_outside_the_trees() {
+    let db = store::Db::temporary().unwrap();
+    let meta = db.open_tree("meta").unwrap();
+    let mut r = Replay::open(&db).unwrap();
+    r.tracked.insert("t3:0".into(), vec![(0, "t3i0".into())]);
+    r.recent.push_back((4_800_000, "h".into()));
+    (r.created, r.settled) = (25_822_000, 8_602);
+    save_place(&db, &meta, &mut r, 4_800_064).unwrap();
+    let c: Checkpoint = bincode::deserialize(meta.get(RESUME_KEY).unwrap().unwrap().as_ref()).unwrap();
+    assert_eq!((c.next, c.created, c.settled), (4_800_064, 25_822_000, 8_602));
+    assert_eq!(c.tracked["t3:0"], vec![(0, "t3i0".to_string())]);
+    assert_eq!(c.recent.back(), Some(&(4_800_000, "h".to_string())));
   }
 }

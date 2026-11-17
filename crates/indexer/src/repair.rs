@@ -60,15 +60,45 @@ pub fn inscription_repair_done(config: &Config) -> Result<bool> {
   Ok(load_state(&db.open_tree("meta")?)?.done)
 }
 
+/// Tries a node call up to 12 times over about three minutes. The replays
+/// read blocks for hours, and dogecoind drops a connection now and then
+/// ("an established connection was aborted"); failing on that used to start
+/// a whole replay over, several times a day.
+async fn with_retry<T, F, Fut>(what: &str, mut call: F) -> Result<T>
+where
+  F: FnMut() -> Fut,
+  Fut: std::future::Future<Output = Result<T>>,
+{
+  let mut wait = Duration::from_millis(500);
+  for attempt in 1.. {
+    match call().await {
+      Ok(v) => return Ok(v),
+      Err(e) if attempt < 12 => {
+        warn!("{what}: {e:#}; retrying in {wait:.1?} (attempt {attempt})");
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(30));
+      }
+      Err(e) => return Err(e),
+    }
+  }
+  unreachable!()
+}
+
 pub(crate) async fn fetch_block(client: &Client, config: &Config, height: u64) -> Result<RpcBlock> {
-  let hash: String = rpc_call(client, config, "getblockhash", serde_json::json!([height])).await?;
-  rpc_call(client, config, "getblock", serde_json::json!([hash, 2])).await
+  with_retry(&format!("block {height}"), || async {
+    let hash: String = rpc_call(client, config, "getblockhash", serde_json::json!([height])).await?;
+    rpc_call(client, config, "getblock", serde_json::json!([hash, 2])).await
+  })
+  .await
 }
 
 /// The value of an output the index no longer has (it was spent long ago).
 pub(crate) async fn prev_value(client: &Client, config: &Config, cache: &mut HashMap<String, Vec<u64>>, txid: &str, vout: u32) -> Result<u64> {
   if !cache.contains_key(txid) {
-    let tx: RpcTx = rpc_call(client, config, "getrawtransaction", serde_json::json!([txid, true])).await?;
+    let tx: RpcTx = with_retry(&format!("transaction {txid}"), || {
+      rpc_call(client, config, "getrawtransaction", serde_json::json!([txid, true]))
+    })
+    .await?;
     let values = tx.vout.iter().map(|o| to_satoshis(o.value)).collect::<Result<Vec<_>>>()?;
     if cache.len() > 4096 {
       cache.clear();

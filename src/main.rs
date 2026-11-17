@@ -74,7 +74,76 @@ async fn main() -> Result<()> {
     }
   });
 
-  let indexer = tokio::spawn(run_indexer(cfg, SharedState::new(), shutdown_rx));
+  // TAP tokens, copied from Trac's own index through a local tap-reader
+  // (DOGEORD_TAP_READER_URL). It waits quietly while no reader is running.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    loop {
+      if let Err(e) = dogeord_indexer::run_tap_sync(c.clone()).await {
+        error!("tap sync stopped, restarting in a minute: {e:#}");
+      }
+      tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+  });
+
+  // One-off: recover inscriptions the old reveal-chain rule lost (see the
+  // repair module). Does nothing once it has completed.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    loop {
+      match dogeord_indexer::run_inscription_repair(c.clone()).await {
+        Ok(()) => break,
+        Err(e) => {
+          error!("inscription repair stopped (it resumes where it was), retrying in a minute: {e:#}");
+          tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+      }
+    }
+  });
+
+  // One-off: renumber to match ord-dogecoin (see the renumber module). Only
+  // when a plan is in the data directory; does nothing once done.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    if let Err(e) = dogeord_indexer::run_renumber(c).await {
+      error!("renumber failed (nothing is marked done, so it runs again at the next start): {e:#}");
+    }
+  });
+
+  // One-off: rebuild DRC-20 balances by replaying blocks, then swap them in
+  // at the tip (see the drc20_replay module). It saves its place on a clean
+  // stop and resumes on the next start.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    loop {
+      match dogeord_indexer::run_drc20_replay(c.clone()).await {
+        Ok(()) => break,
+        Err(e) => {
+          error!("drc20 replay stopped, starting it over in a minute: {e:#}");
+          tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+      }
+    }
+  });
+
+  // One-off: rebuild Dune state under the reference rules by replaying
+  // blocks from the first Dune block, then swap it in at the tip (see the
+  // dune_replay module). Live indexing skips Dunes until it is done.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    loop {
+      match dogeord_indexer::run_dune_replay(c.clone()).await {
+        Ok(()) => break,
+        Err(e) => {
+          dogeord_indexer::dune_replay_failed(&e);
+          error!("dune replay stopped, starting it over in a minute: {e:#}");
+          tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+      }
+    }
+  });
+
+  let mut indexer = tokio::spawn(run_indexer(cfg, SharedState::new(), shutdown_rx));
 
   #[cfg(unix)]
   let shutdown = async {
@@ -88,10 +157,24 @@ async fn main() -> Result<()> {
   let shutdown = tokio::signal::ctrl_c();
 
   tokio::select! {
-    res = indexer => res??,
+    res = &mut indexer => res??,
     _ = shutdown => {
       info!("stopping: finishing the current block");
       let _ = shutdown_tx.send(true);
+      // Let the DRC-20 rebuild finish its block and save its place, so the
+      // next start resumes it.
+      if dogeord_indexer::pause_drc20_replay(Duration::from_secs(90)).await {
+        info!("DRC-20 rebuild at rest");
+      } else {
+        error!("DRC-20 rebuild did not save its place in time; it starts over next time");
+      }
+      // and let the main index finish its block and flush before exiting
+      match tokio::time::timeout(Duration::from_secs(120), indexer).await {
+        Ok(Ok(Ok(()))) => info!("index flushed"),
+        Ok(Ok(Err(e))) => error!("indexer stopped with an error: {e:#}"),
+        Ok(Err(e)) => error!("indexer task failed: {e}"),
+        Err(_) => error!("indexer did not stop within 2 minutes; exiting anyway"),
+      }
     }
   }
   Ok(())

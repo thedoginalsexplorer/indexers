@@ -94,6 +94,11 @@ const KNOWN_TREES: &[&str] = &[
   "dune_meta_by_id",
   "dune_entry_by_id",
   "dune_balances_by_outpoint",
+  // Dunes by protocol id (block:tx) with the reference's full entry, names
+  // to ids and counters, see dunes.rs; and the Dune activity rebuilt by the
+  // one-off replay (dune_replay.rs), swapped in at the tip
+  "dune_index",
+  "duner_activity",
   "dogemap_by_number",
   "dogemap_by_inscription",
   "dogemap_by_address",

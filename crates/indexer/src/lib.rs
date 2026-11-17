@@ -6,6 +6,8 @@ mod repair;
 mod renumber;
 mod drc20_replay;
 mod dfeed;
+mod dunes;
+mod dune_replay;
 
 pub use dns::{
   ClaimEntry, DnsConfigView, DnsListed, DnsName, DnsNameView, DnsPage, DnsRecords, DnsRole, DnsStatus, DnsSupply, dns_claims,
@@ -15,7 +17,12 @@ pub use dns::{
 
 pub use repair::{inscription_repair_done, run_inscription_repair};
 pub use renumber::{renumber_done, run_renumber};
-pub use drc20_replay::{drc20_replay_done, run_drc20_replay};
+pub use drc20_replay::{
+  drc20_replay_done, drc20_replay_done_cached, drc20_replay_progress, drc20_servable_cached, pause_drc20_replay,
+  run_drc20_replay,
+};
+pub use dune_replay::{DuneReplayStatus, dune_replay_failed, dune_replay_status, dunes_rebuilt, run_dune_replay};
+pub use dunes::{Entry as DuneProtocolEntry, dune_entries, dune_entry, dune_holders_built, dune_number, format_id as format_dune_id};
 pub use dfeed::{DfRecord, DfeedStatus, dfeed_by_account, dfeed_by_inscription, dfeed_by_txid, dfeed_pointing_at, dfeed_records, dfeed_status, run_dfeed_index};
 
 pub use tap::{
@@ -81,8 +88,6 @@ static PHASE_OUTPUTS_NS: AtomicU64 = AtomicU64::new(0);
 static PHASE_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
 
 static DRC20_PROTOCOL: Lazy<String> = Lazy::new(|| "drc-20".to_string());
-const DUNE_CLAIM_BIT: u128 = 1 << 48;
-const DUNE_MAX_LIMIT: u128 = u64::MAX as u128;
 
 #[derive(Debug, Clone)]
 pub struct SharedState {
@@ -590,24 +595,6 @@ pub struct DuneUtxo {
   pub satoshis: u64,
 }
 
-#[derive(Debug, Default)]
-struct ParsedDunestone {
-  pointer: Option<usize>,
-  edicts: Vec<(u128, u128, u128)>, // (id, amount, output)
-  etching: Option<ParsedEtching>,
-  cenotaph: bool,
-}
-
-#[derive(Debug)]
-struct ParsedEtching {
-  dune: Option<u128>,
-  divisibility: u8,
-  spacers: u32,
-  symbol: Option<char>,
-  premine: u128,
-  terms: Option<DuneTerms>,
-}
-
 #[derive(Debug, Clone)]
 struct ParsedInscriptionData {
   content_type: String,
@@ -780,6 +767,33 @@ pub async fn run_indexer(
 
   let protocol_start = config.protocol_start_height();
   state.set_protocol_start_height(protocol_start).await;
+
+  // A one-time manual rollback: a `rollback-to` file in the data directory
+  // holding a height. The recorded height is set back to it, so the
+  // reconcile below takes every later block back through its undo log, as a
+  // reorg does (numbers and DNS included), and they are indexed again. The
+  // file is removed once read. Refused unless every later block has its
+  // undo log, so it only reaches back as far as a reorg could.
+  let rollback_file = std::path::Path::new(&config.data_dir).join("rollback-to");
+  if rollback_file.exists() {
+    let text = std::fs::read_to_string(&rollback_file).context("read rollback-to")?;
+    let target: u64 = text.trim().parse().with_context(|| format!("rollback-to holds {:?}, not a height", text.trim()))?;
+    let indexed = match meta.get(b"indexed_height")? {
+      Some(v) => decode_u64(v.as_ref())?,
+      None => 0,
+    };
+    if target < indexed {
+      for h in target + 1..=indexed {
+        if undo_by_height.get(encode_u64(h))?.is_none() {
+          bail!("rollback-to {target}: block {h} has no undo log, so it cannot be taken back");
+        }
+      }
+      warn!("rollback-to: taking back blocks {} to {indexed}", target + 1);
+      meta.insert(b"indexed_height", encode_u64(target).to_vec())?;
+      db.flush()?;
+    }
+    std::fs::remove_file(&rollback_file).context("remove rollback-to")?;
+  }
 
   let mut next_height = match meta.get(b"indexed_height")? {
     Some(v) => decode_u64(v.as_ref())? + 1,
@@ -1362,6 +1376,12 @@ fn index_block(
   block_time: u64,
   undo: &mut UndoRecorder,
 ) -> Result<()> {
+  let dune_index = if height >= config.first_dune_height && dune_replay::dunes_rebuilt_cached(config)? {
+    Some(open_db(&config.db_path())?.open_tree("dune_index")?)
+  } else {
+    None
+  };
+
   // State-independent work, computed across cores before the sequential pass.
   let prepared = prepare_block(txs)?;
 
@@ -1503,18 +1523,26 @@ fn index_block(
       }
     }
 
+    // Dunes: the reference's rules (dunes.rs), from the first Dune block, and
+    // only once the replay has rebuilt the state they build on.
     let mut dune_events = Vec::new();
-    process_dunes(
-      tx,
-      tx_index,
-      height,
-      dune_meta_by_id,
-      dune_entry_by_id,
-      dune_balances_by_outpoint,
-      undo,
-      &mut dune_events,
-    )?;
-    for e in dune_events {
+    if let Some(dune_index) = dune_index.as_ref() {
+      let mut st = dunes::TreeState {
+        meta: dune_meta_by_id,
+        entries: dune_entry_by_id,
+        balances: dune_balances_by_outpoint,
+        index: dune_index,
+        undo,
+      };
+      let mut raw = Vec::new();
+      dunes::index_tx(&mut st, tx, tx_index, height, block_time, config.first_dune_height, &mut raw)?;
+      for e in raw {
+        if let Some(entry) = dunes::State::entry(&mut st, e.id)? {
+          dune_events.push((entry.public_id(), e));
+        }
+      }
+    }
+    for (dune_id, e) in dune_events {
       let event = ActivityEvent {
         kind: e.kind.to_string(),
         amount: e.amount.to_string(),
@@ -1525,7 +1553,7 @@ fn index_block(
         height,
         time: block_time,
       };
-      record_activity(token_activity, undo, &dune_scope(&e.dune_id), tx_index, e.kind, &event)?;
+      record_activity(token_activity, undo, &dune_scope(&dune_id), tx_index, e.kind, &event)?;
     }
 
     PHASE_INPUTS_NS.fetch_add(inputs_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -1792,6 +1820,32 @@ fn index_block(
         lost.id.as_bytes(),
         bincode::serialize(&lost)?,
       )?;
+
+      // A transfer inscription spent as fee settles back to its sender (an
+      // empty destination), as the reference indexers do. Without this its
+      // amount stayed locked as transferable for good.
+      if lost.id != format!("{}i0", tx.txid) {
+        let moved = process_drc20_transfer_move_with_undo(
+          drc20_balance,
+          drc20_transferable_by_id,
+          &lost.id,
+          "",
+          Some(&mut *undo),
+        )?;
+        if let Some(m) = moved {
+          let event = ActivityEvent {
+            kind: "transfer".to_string(),
+            amount: m.amount.to_string(),
+            from: m.from,
+            to: m.to,
+            inscription_id: lost.id.clone(),
+            txid: tx.txid.clone(),
+            height,
+            time: block_time,
+          };
+          record_activity(token_activity, undo, &drc20_scope(&m.tick), tx_index, &format!("{}|transfer", lost.id), &event)?;
+        }
+      }
     }
     PHASE_OUTPUTS_NS.fetch_add(outputs_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
   }
@@ -1858,298 +1912,6 @@ fn record_activity(
   undo.insert("token_activity", tree, key.as_bytes(), bincode::serialize(event)?)
 }
 
-/// Something a transaction did to a dune, reported for the activity record.
-/// Collecting these never changes how balances are computed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DuneEvent {
-  dune_id: String,
-  kind: &'static str,
-  amount: u128,
-}
-
-fn process_dunes(
-  tx: &RpcTx,
-  tx_index: usize,
-  height: u64,
-  dune_meta_by_id: &store::Tree,
-  dune_entry_by_id: &store::Tree,
-  dune_balances_by_outpoint: &store::Tree,
-  undo: &mut UndoRecorder,
-  events: &mut Vec<DuneEvent>,
-) -> Result<()> {
-  let mut unallocated: HashMap<String, u128> = HashMap::new();
-  let mut mintable_remaining: HashMap<String, u128> = HashMap::new();
-  let mut mintable_limit: HashMap<String, u128> = HashMap::new();
-
-  // Pull dune balances from spent inputs into unallocated map.
-  for vin in &tx.vin {
-    let (Some(prev_txid), Some(prev_vout)) = (&vin.txid, vin.vout) else {
-      continue;
-    };
-    let prefix = format!("{}:{}|", prev_txid, prev_vout);
-    let mut remove_keys = Vec::new();
-    for item in dune_balances_by_outpoint.scan_prefix(prefix.as_bytes())? {
-      let (k, v) = item?;
-      let key = String::from_utf8(k.to_vec()).context("invalid dune outpoint key utf8")?;
-      let dune_id = key
-        .split('|')
-        .nth(1)
-        .ok_or_else(|| anyhow!("invalid dune outpoint key format"))?
-        .to_string();
-      let amt = decode_u128(v.as_ref())?;
-      *unallocated.entry(dune_id).or_default() += amt;
-      remove_keys.push(k);
-    }
-    for k in remove_keys {
-      undo.remove(
-        "dune_balances_by_outpoint",
-        dune_balances_by_outpoint,
-        k.as_ref(),
-      )?;
-    }
-  }
-
-  // What the inputs carried in, before this transaction adds or mints any.
-  let spent: Vec<(String, u128)> = unallocated
-    .iter()
-    .filter(|(_, a)| **a > 0)
-    .map(|(id, a)| (id.clone(), *a))
-    .collect();
-  let report_spent = |events: &mut Vec<DuneEvent>, kind: &'static str| {
-    for (dune_id, amount) in &spent {
-      events.push(DuneEvent { dune_id: dune_id.clone(), kind, amount: *amount });
-    }
-  };
-
-  let Some(dunestone) = parse_dunestone(tx) else {
-    // no protocol message; default pass-through remains in unallocated and is assigned below
-    assign_unallocated_default(tx, unallocated, None, dune_balances_by_outpoint, undo)?;
-    report_spent(events, "transfer");
-    return Ok(());
-  };
-
-  let mut issued_dune_id: Option<String> = None;
-  if let Some(etch) = dunestone.etching {
-    let numeric = etch
-      .dune
-      .unwrap_or_else(|| ((height as u128) << 16) | (tx_index as u128 & 0xFFFF));
-    let name = dune_name(numeric);
-    let dune_id = format!("DOGECOIN:{name}");
-    let meta = DuneMeta {
-      id: dune_id.clone(),
-      name: apply_spacers(&name, etch.spacers),
-      symbol: etch.symbol.map(|c| c.to_string()).unwrap_or_default(),
-      divisibility: etch.divisibility,
-    };
-    if dune_meta_by_id.get(dune_id.as_bytes())?.is_none() {
-      undo.insert(
-        "dune_meta_by_id",
-        dune_meta_by_id,
-        dune_id.as_bytes(),
-        bincode::serialize(&meta)?,
-      )?;
-      events.push(DuneEvent { dune_id: dune_id.clone(), kind: "etch", amount: etch.premine });
-    }
-    let entry = DuneEntryLite {
-      id: dune_id.clone(),
-      etched_height: height,
-      premine: etch.premine,
-      supply: etch.premine,
-      burned: 0,
-      mints: 0,
-      terms: if dunestone.cenotaph { None } else { etch.terms.clone() },
-    };
-    if dune_entry_by_id.get(dune_id.as_bytes())?.is_none() {
-      undo.insert(
-        "dune_entry_by_id",
-        dune_entry_by_id,
-        dune_id.as_bytes(),
-        bincode::serialize(&entry)?,
-      )?;
-    }
-    if etch.premine > 0 {
-      *unallocated.entry(dune_id.clone()).or_default() += etch.premine;
-    }
-    issued_dune_id = Some(dune_id.clone());
-  }
-
-  if dunestone.cenotaph {
-    // Cenotaph burns all unallocated input balances by not allocating them.
-    report_spent(events, "burn");
-    return Ok(());
-  }
-
-  for (id, amount, output) in dunestone.edicts {
-    let mut from_claim = false;
-    let target_dune = if id == 0 {
-      match &issued_dune_id {
-        Some(x) => x.clone(),
-        None => continue,
-      }
-    } else if let Some(claimed) = dune_claim_target(id) {
-      let target = format!("DOGECOIN:{}", dune_name(claimed));
-      let Some(raw_entry) = dune_entry_by_id.get(target.as_bytes())? else {
-        continue;
-      };
-      let entry: DuneEntryLite = bincode::deserialize(raw_entry.as_ref())?;
-      let Some(limit) = dune_mintable_limit(&entry, height) else {
-        continue;
-      };
-      mintable_limit.entry(target.clone()).or_insert(limit);
-      mintable_remaining.entry(target.clone()).or_insert(limit);
-      from_claim = true;
-      target
-    } else {
-      // interpret as numeric dune id for lookups if previously etched.
-      let as_name = dune_name(id);
-      let as_id = format!("DOGECOIN:{as_name}");
-      if dune_meta_by_id.get(as_id.as_bytes())?.is_none() {
-        continue;
-      }
-      as_id
-    };
-
-    let bal = if from_claim {
-      mintable_remaining.entry(target_dune.clone()).or_default()
-    } else {
-      unallocated.entry(target_dune.clone()).or_default()
-    };
-    if *bal == 0 {
-      continue;
-    }
-
-    if output == tx.vout.len() as u128 {
-      let destinations: Vec<usize> = tx
-        .vout
-        .iter()
-        .enumerate()
-        .filter_map(|(i, v)| (!is_op_return(v)).then_some(i))
-        .collect();
-      if destinations.is_empty() {
-        continue;
-      }
-      if amount == 0 {
-        let each = *bal / destinations.len() as u128;
-        let rem = (*bal % destinations.len() as u128) as usize;
-        for (i, out) in destinations.iter().enumerate() {
-          let a = if i < rem { each + 1 } else { each };
-          if a > 0 {
-            add_dune_to_output(tx, *out, &target_dune, a, dune_balances_by_outpoint, undo)?;
-            *bal = bal.saturating_sub(a);
-          }
-        }
-      } else {
-        for out in destinations {
-          let a = amount.min(*bal);
-          if a == 0 {
-            break;
-          }
-          add_dune_to_output(tx, out, &target_dune, a, dune_balances_by_outpoint, undo)?;
-          *bal = bal.saturating_sub(a);
-        }
-      }
-    } else {
-      let Ok(output) = usize::try_from(output) else {
-        continue;
-      };
-      let a = if amount == 0 { *bal } else { amount.min(*bal) };
-      if a > 0 {
-        add_dune_to_output(tx, output, &target_dune, a, dune_balances_by_outpoint, undo)?;
-        *bal = bal.saturating_sub(a);
-      }
-    }
-  }
-
-  for (dune_id, remaining) in mintable_remaining {
-    let Some(limit) = mintable_limit.get(&dune_id).copied() else {
-      continue;
-    };
-    let minted = limit.saturating_sub(remaining);
-    if minted == 0 {
-      continue;
-    }
-    let Some(raw_entry) = dune_entry_by_id.get(dune_id.as_bytes())? else {
-      continue;
-    };
-    let mut entry: DuneEntryLite = bincode::deserialize(raw_entry.as_ref())?;
-    entry.supply = entry.supply.saturating_add(minted);
-    entry.mints = entry.mints.saturating_add(1);
-    undo.insert(
-      "dune_entry_by_id",
-      dune_entry_by_id,
-      dune_id.as_bytes(),
-      bincode::serialize(&entry)?,
-    )?;
-    events.push(DuneEvent { dune_id: dune_id.clone(), kind: "mint", amount: minted });
-  }
-
-  assign_unallocated_default(
-    tx,
-    unallocated,
-    dunestone.pointer,
-    dune_balances_by_outpoint,
-    undo,
-  )?;
-  report_spent(events, "transfer");
-
-  Ok(())
-}
-
-fn assign_unallocated_default(
-  tx: &RpcTx,
-  unallocated: HashMap<String, u128>,
-  pointer: Option<usize>,
-  dune_balances_by_outpoint: &store::Tree,
-  undo: &mut UndoRecorder,
-) -> Result<()> {
-  let default = pointer
-    .filter(|p| *p < tx.vout.len())
-    .or_else(|| {
-      tx.vout
-        .iter()
-        .enumerate()
-        .find_map(|(i, v)| (!is_op_return(v)).then_some(i))
-    });
-
-  let Some(default_vout) = default else {
-    return Ok(());
-  };
-
-  for (dune_id, amount) in unallocated {
-    if amount == 0 {
-      continue;
-    }
-    add_dune_to_output(tx, default_vout, &dune_id, amount, dune_balances_by_outpoint, undo)?;
-  }
-  Ok(())
-}
-
-fn add_dune_to_output(
-  tx: &RpcTx,
-  vout: usize,
-  dune_id: &str,
-  amount: u128,
-  dune_balances_by_outpoint: &store::Tree,
-  undo: &mut UndoRecorder,
-) -> Result<()> {
-  if vout >= tx.vout.len() || is_op_return(&tx.vout[vout]) {
-    return Ok(());
-  }
-  let key = format!("{}:{}|{}", tx.txid, tx.vout[vout].n, dune_id);
-  let prior = dune_balances_by_outpoint
-    .get(key.as_bytes())?
-    .map(|v| decode_u128(v.as_ref()))
-    .transpose()?
-    .unwrap_or(0);
-  undo.insert(
-    "dune_balances_by_outpoint",
-    dune_balances_by_outpoint,
-    key.as_bytes(),
-    encode_u128(prior + amount).to_vec(),
-  )?;
-  Ok(())
-}
-
 fn is_op_return(vout: &RpcVout) -> bool {
   vout
     .script_pub_key
@@ -2191,326 +1953,6 @@ fn parse_drc20_action(content_type: &str, body: &[u8]) -> Option<Drc20Action> {
     }),
     _ => None,
   }
-}
-
-fn parse_dunestone(tx: &RpcTx) -> Option<ParsedDunestone> {
-  let payload = tx
-    .vout
-    .iter()
-    .find_map(dune_payload_from_output)?;
-
-  let (integers, mut cenotaph) = decode_dune_varints(&payload);
-  if integers.is_empty() {
-    return Some(ParsedDunestone {
-      cenotaph,
-      ..ParsedDunestone::default()
-    });
-  }
-
-  let mut fields: HashMap<u128, u128> = HashMap::new();
-  let mut edicts = Vec::<(u128, u128, u128)>::new();
-
-  let mut i = 0usize;
-  while i + 1 < integers.len() {
-    let tag = integers[i];
-    if tag == 0 {
-      let mut last_id = 0u128;
-      let rest = &integers[i + 1..];
-      for chunk in rest.chunks_exact(3) {
-        let id = last_id.saturating_add(chunk[0]);
-        let amount = chunk[1];
-        let output = chunk[2];
-        if !is_valid_dune_id(id) || output > tx.vout.len() as u128 {
-          cenotaph = true;
-          continue;
-        }
-        edicts.push((id, amount, output));
-        last_id = id;
-      }
-      if !rest.len().is_multiple_of(3) {
-        cenotaph = true;
-      }
-      break;
-    }
-    let value = integers[i + 1];
-    fields.entry(tag).or_insert(value);
-    i += 2;
-  }
-  if i + 1 == integers.len() {
-    cenotaph = true;
-  }
-
-  // Unknown even tags are cenotaph.
-  for tag in fields.keys() {
-    if tag % 2 == 0 && !matches!(*tag, 2 | 4 | 6 | 8 | 10 | 12 | 14 | 16 | 18 | 20 | 22 | 254) {
-      cenotaph = true;
-      break;
-    }
-  }
-
-  // Flags with unknown bits are cenotaph.
-  if let Some(flags) = fields.get(&2).copied() {
-    let known = 1u128 | 2u128 | 4u128;
-    if flags & !known != 0 {
-      cenotaph = true;
-    }
-  }
-
-  let pointer = fields.get(&12).and_then(|v| usize::try_from(*v).ok());
-  let flags = fields.get(&2).copied().unwrap_or_default();
-  let has_etching = flags & 1u128 != 0;
-  let has_terms = flags & 2u128 != 0;
-
-  let divisibility = fields
-    .get(&1)
-    .and_then(|d| u8::try_from(*d).ok())
-    .filter(|d| *d <= 38)
-    .unwrap_or(0);
-  let dune = fields.get(&4).copied();
-  let spacers = fields
-    .get(&3)
-    .and_then(|s| u32::try_from(*s).ok())
-    .unwrap_or(0);
-  let symbol = fields
-    .get(&5)
-    .and_then(|s| u32::try_from(*s).ok())
-    .and_then(char::from_u32);
-  let premine = fields.get(&22).copied().unwrap_or(0);
-  let limit = fields.get(&6).copied().map(|v| v.min(DUNE_MAX_LIMIT));
-  let cap = fields.get(&20).copied();
-  let height_start = fields.get(&14).and_then(|v| u64::try_from(*v).ok());
-  let height_end = fields.get(&18).and_then(|v| u64::try_from(*v).ok());
-  let offset_start = fields.get(&16).and_then(|v| u64::try_from(*v).ok());
-  let offset_end = fields.get(&8).and_then(|v| u64::try_from(*v).ok());
-
-  let etching = if has_etching || dune.is_some() || premine > 0 {
-    Some(ParsedEtching {
-      dune,
-      divisibility,
-      spacers,
-      symbol,
-      premine,
-      terms: has_terms.then_some(DuneTerms {
-        cap,
-        limit,
-        height_start,
-        height_end,
-        offset_start,
-        offset_end,
-      }),
-    })
-  } else {
-    None
-  };
-
-  let mut out = ParsedDunestone {
-    pointer,
-    edicts,
-    etching,
-    cenotaph,
-  };
-
-  if premine > 0 {
-    // Mirror Wonky's behavior of adding a premine edict id=0 amount=premine output=1.
-    out.edicts.push((0, premine, 1));
-  }
-
-  Some(out)
-}
-
-fn dune_payload_from_output(vout: &RpcVout) -> Option<Vec<u8>> {
-  if let Some(script_hex) = vout.script_pub_key.hex.as_deref()
-    && let Ok(script) = hex::decode(script_hex)
-    && let Ok(payload) = dune_payload_from_script_bytes(&script)
-  {
-    return payload;
-  }
-
-  if !is_op_return(vout) {
-    return None;
-  }
-
-  let asm = vout.script_pub_key.asm.as_deref()?;
-  let mut tokens = asm.split_whitespace();
-  if tokens.next()? != "OP_RETURN" {
-    return None;
-  }
-  if tokens.next()? != "44" {
-    return None;
-  }
-  let mut payload = Vec::new();
-  for t in tokens {
-    if t.starts_with("OP_") {
-      continue;
-    }
-    if let Ok(bytes) = hex::decode(t) {
-      payload.extend_from_slice(&bytes);
-    }
-  }
-  Some(payload)
-}
-
-fn dune_payload_from_script_bytes(script: &[u8]) -> Result<Option<Vec<u8>>> {
-  let mut i = 0usize;
-  let Some(op) = script.get(i).copied() else {
-    return Ok(None);
-  };
-  i += 1;
-  if op != 0x6a {
-    return Ok(None);
-  }
-
-  let Some(marker) = script_read_push(script, &mut i)? else {
-    return Ok(None);
-  };
-  if marker != [0x44] {
-    return Ok(None);
-  }
-
-  let mut payload = Vec::new();
-  while i < script.len() {
-    let op = script[i];
-    i += 1;
-    if (1..=0x4e).contains(&op) {
-      if let Some(data) = script_read_push_with_opcode(script, &mut i, op)? {
-        payload.extend_from_slice(data);
-      }
-    }
-  }
-  Ok(Some(payload))
-}
-
-fn script_read_push<'a>(script: &'a [u8], i: &mut usize) -> Result<Option<&'a [u8]>> {
-  let Some(op) = script.get(*i).copied() else {
-    return Ok(None);
-  };
-  *i += 1;
-  script_read_push_with_opcode(script, i, op)
-}
-
-fn script_read_push_with_opcode<'a>(
-  script: &'a [u8],
-  i: &mut usize,
-  op: u8,
-) -> Result<Option<&'a [u8]>> {
-  let len = match op {
-    0x01..=0x4b => op as usize,
-    0x4c => {
-      let Some(v) = script.get(*i).copied() else {
-        bail!("truncated pushdata1");
-      };
-      *i += 1;
-      v as usize
-    }
-    0x4d => {
-      let Some(bytes) = script.get(*i..*i + 2) else {
-        bail!("truncated pushdata2");
-      };
-      *i += 2;
-      u16::from_le_bytes([bytes[0], bytes[1]]) as usize
-    }
-    0x4e => {
-      let Some(bytes) = script.get(*i..*i + 4) else {
-        bail!("truncated pushdata4");
-      };
-      *i += 4;
-      u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
-    }
-    _ => return Ok(None),
-  };
-  let Some(data) = script.get(*i..*i + len) else {
-    bail!("truncated push bytes");
-  };
-  *i += len;
-  Ok(Some(data))
-}
-
-fn decode_dune_varints(payload: &[u8]) -> (Vec<u128>, bool) {
-  let mut out = Vec::new();
-  let mut i = 0usize;
-  let mut cenotaph = false;
-  while i < payload.len() {
-    let (n, len, truncated) = dune_varint_decode(&payload[i..]);
-    if truncated {
-      cenotaph = true;
-      break;
-    }
-    if len == 0 {
-      break;
-    }
-    out.push(n);
-    i += len;
-  }
-  (out, cenotaph)
-}
-
-fn dune_varint_decode(buffer: &[u8]) -> (u128, usize, bool) {
-  let mut n = 0u128;
-  let mut i = 0usize;
-  loop {
-    let Some(b) = buffer.get(i).copied() else {
-      return (n, i, i > 0);
-    };
-    let b = u128::from(b);
-    n = n.saturating_mul(128);
-    if b < 128 {
-      return (n.saturating_add(b), i + 1, false);
-    }
-    n = n.saturating_add(b - 127);
-    i += 1;
-  }
-}
-
-fn is_valid_dune_id(id: u128) -> bool {
-  let height = id >> 16;
-  let index = id & 0xFFFF;
-  !(height == 0 && index > 0)
-}
-
-fn dune_claim_target(id: u128) -> Option<u128> {
-  (id & DUNE_CLAIM_BIT != 0).then_some(id ^ DUNE_CLAIM_BIT)
-}
-
-fn dune_mintable_limit(entry: &DuneEntryLite, height: u64) -> Option<u128> {
-  let terms = entry.terms.as_ref()?;
-
-  let start_rel = terms.offset_start.map(|o| entry.etched_height.saturating_add(o));
-  let start = match (start_rel, terms.height_start) {
-    (Some(a), Some(b)) => Some(a.max(b)),
-    (Some(a), None) => Some(a),
-    (None, Some(b)) => Some(b),
-    (None, None) => None,
-  };
-
-  if let Some(s) = start
-    && height < s
-  {
-    return None;
-  }
-
-  let end_rel = terms.offset_end.map(|o| entry.etched_height.saturating_add(o));
-  let end = match (end_rel, terms.height_end) {
-    (Some(a), Some(b)) => Some(a.min(b)),
-    (Some(a), None) => Some(a),
-    (None, Some(b)) => Some(b),
-    (None, None) => None,
-  };
-
-  if let Some(e) = end
-    && height >= e
-  {
-    return None;
-  }
-
-  if let Some(cap) = terms.cap {
-    if entry.mints >= cap {
-      return None;
-    }
-  } else if entry.mints >= u128::MAX {
-    return None;
-  }
-
-  Some(terms.limit.unwrap_or_default())
 }
 
 fn dune_name(mut n: u128) -> String {
@@ -2576,12 +2018,15 @@ fn validate_drc20_deploy(max_supply: &str, mint_limit: Option<&str>, decimals: O
   if dec > 18 {
     return None;
   }
+  // As ord-dogecoin: max and lim may not exceed u64::MAX whole tokens. A
+  // deploy over it is invalid, so a later deploy of the tick can still count.
+  let cap = u128::from(u64::MAX) * 10u128.pow(dec.into());
   let supply = parse_decimal_amount(max_supply, dec).ok()?;
-  if supply == 0 {
+  if supply == 0 || supply > cap {
     return None;
   }
   let limit = parse_decimal_amount(mint_limit.unwrap_or(max_supply), dec).ok()?;
-  if limit == 0 {
+  if limit == 0 || limit > cap {
     return None;
   }
   Some((supply, limit, dec))
@@ -2872,11 +2317,15 @@ fn process_drc20_transfer_move_with_undo(
   }))
 }
 
+/// The tick a DRC-20 operation names, as stored. Ticks match without regard
+/// to case, Unicode letters included, as in ord-dogecoin (which compares
+/// lowercased ticks): "φOG" and "ΦOG" are one token. Lowercasing first and
+/// then uppercasing only ASCII keeps every plain tick exactly as before.
 fn canonical_tick(tick: &str) -> Result<String> {
   if tick.as_bytes().len() != 4 {
     bail!("invalid tick length");
   }
-  Ok(tick.to_ascii_uppercase())
+  Ok(tick.to_lowercase().to_ascii_uppercase())
 }
 
 fn parse_decimal_amount(s: &str, decimals: u8) -> Result<u128> {
@@ -3073,6 +2522,52 @@ fn process_inscription_candidate(
 
 fn parse_inscription_outcome(scripts: &[Vec<u8>]) -> InscriptionParseOutcome {
   parse_inscription_outcome_with(scripts, decode_push_datas)
+}
+
+/// What a reveal chain's input-0 scriptSigs make so far, read exactly as the
+/// indexer reads them. For callers outside the indexer (the mempool view).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevealParse {
+  None,
+  Partial,
+  Complete { content_type: String, body: Vec<u8>, delegate: Option<String> },
+}
+
+pub fn parse_reveal_scripts(scripts: &[Vec<u8>]) -> RevealParse {
+  match parse_inscription_outcome(scripts) {
+    InscriptionParseOutcome::None => RevealParse::None,
+    InscriptionParseOutcome::Partial => RevealParse::Partial,
+    InscriptionParseOutcome::Complete(content_type, body, delegate) => RevealParse::Complete { content_type, body, delegate },
+  }
+}
+
+/// The declared content type and piece count of a chain's first scriptSig, or
+/// None if it does not open an inscription envelope.
+pub fn reveal_header(script: &[u8]) -> Option<(String, usize)> {
+  let push_datas = decode_push_datas(script)?;
+  if push_datas.len() < 3 || push_datas[0].as_slice() != b"ord" {
+    return None;
+  }
+  let npieces = push_data_to_number(&push_datas[1]).filter(|n| *n > 0)?;
+  Some((str::from_utf8(&push_datas[2]).map(str::to_string).unwrap_or_default(), npieces))
+}
+
+/// Unfinished reveal chains the indexer holds from confirmed blocks, keyed by
+/// the txid of each chain's last transaction: (first txid, scriptSigs so far).
+pub fn find_partial_chains(config: &Config, tail_txids: &[String]) -> Result<HashMap<String, (String, Vec<Vec<u8>>)>> {
+  let mut out = HashMap::new();
+  if tail_txids.is_empty() {
+    return Ok(out);
+  }
+  let db = open_db(&config.db_path())?;
+  let tree = db.open_tree("partial_inscription_chain")?;
+  for (txid, raw) in tail_txids.iter().zip(tree.multi_get(tail_txids)?) {
+    if let Some(raw) = raw {
+      let chain: PartialInscriptionChain = bincode::deserialize(raw.as_ref())?;
+      out.insert(txid.clone(), (chain.start_txid, chain.scripts));
+    }
+  }
+  Ok(out)
 }
 
 /// The envelope parse with a given way of reading pushes (the replay that
@@ -3333,7 +2828,6 @@ pub fn list_spendable_utxos_for_address(config: &Config, address: &str) -> Resul
   let db = open_db(&db_path)?;
   let outpoints_by_address = db.open_tree("outpoints_by_address")?;
   let inscriptions_by_outpoint = db.open_tree("inscriptions_by_outpoint")?;
-  let dune_balances_by_outpoint = db.open_tree("dune_balances_by_outpoint")?;
 
   let prefix = format!("{address}|");
   let mut candidates = Vec::new();
@@ -3347,26 +2841,18 @@ pub fn list_spendable_utxos_for_address(config: &Config, address: &str) -> Resul
     candidates.push((outpoint, decode_u64(v.as_ref())?));
   }
 
-  // Very few outpoints hold dunes, so read those once rather than seeking for
-  // every candidate. The inscription check below still costs a read per outpoint
-  // and dominates on a heavy address (about 50 s at ~800k inscriptions), which
-  // is why the explorer only calls this from its UTXO tab.
-  let mut dune_outpoints = HashSet::new();
-  for item in dune_balances_by_outpoint.scan_prefix(b"")? {
-    let (k, _v) = item?;
-    let key = String::from_utf8(k.to_vec()).context("invalid dune key utf8")?;
-    if let Some((outpoint, _)) = key.split_once('|') {
-      dune_outpoints.insert(outpoint.to_string());
-    }
-  }
-
+  // A read per outpoint for inscriptions and one for dunes (18.7M outputs hold
+  // dunes, too many to read whole). This dominates on a heavy address (about
+  // 50 s at ~800k inscriptions), which is why the explorer only calls this
+  // from its UTXO tab.
   let mut utxos = Vec::new();
   for chunk in candidates.chunks(4096) {
     // Inscriptions for an outpoint are stored as one list under the outpoint key.
     let keys: Vec<&str> = chunk.iter().map(|(outpoint, _)| outpoint.as_str()).collect();
     let inscribed = inscriptions_by_outpoint.multi_get(&keys)?;
-    for ((outpoint, sats), hit) in chunk.iter().zip(inscribed) {
-      if hit.is_none() && !dune_outpoints.contains(outpoint) {
+    let with_dunes = dunes::holding_outpoints(&db, &keys)?;
+    for (((outpoint, sats), hit), has_dunes) in chunk.iter().zip(inscribed).zip(with_dunes) {
+      if hit.is_none() && !has_dunes {
         utxos.push((outpoint.clone(), *sats));
       }
     }
@@ -3440,27 +2926,25 @@ pub fn list_unspent_for_address(config: &Config, address: &str) -> Result<Vec<Un
     return Ok(Vec::new());
   }
 
-  // Few outputs hold Dunes: read them all once, as the spendable list does.
-  let mut dunes: HashMap<String, Vec<UnspentDune>> = HashMap::new();
-  for item in dune_balances_by_outpoint.scan_prefix(b"")? {
-    let (k, v) = item?;
-    let key = String::from_utf8(k.to_vec()).context("invalid dune key utf8")?;
-    if let Some((outpoint, dune_id)) = key.split_once('|') {
-      let amount = decode_u128(v.as_ref())?;
-      if amount > 0 {
-        dunes
-          .entry(outpoint.to_string())
-          .or_default()
-          .push(UnspentDune { id: dune_id.to_string(), amount: amount.to_string() });
-      }
-    }
-  }
-
   let mut decimals: HashMap<String, u8> = HashMap::new();
   let mut out = Vec::with_capacity(candidates.len());
   for chunk in candidates.chunks(4096) {
     let keys: Vec<&str> = chunk.iter().map(|(outpoint, _)| outpoint.as_str()).collect();
     let inscribed = inscriptions_by_outpoint.multi_get(&keys)?;
+    // Which outputs hold dunes, then what each of those holds.
+    let with_dunes = dunes::holding_outpoints(&db, &keys)?;
+    let mut dunes: HashMap<&str, Vec<UnspentDune>> = HashMap::new();
+    for (outpoint, _) in keys.iter().zip(&with_dunes).filter(|(_, d)| **d) {
+      let prefix = format!("{outpoint}|");
+      dune_balances_by_outpoint.for_each_prefix(prefix.as_bytes(), |k, v| {
+        let amount = decode_u128(v)?;
+        if amount > 0 {
+          let dune_id = String::from_utf8_lossy(&k[prefix.len()..]).to_string();
+          dunes.entry(outpoint).or_default().push(UnspentDune { id: dune_id, amount: amount.to_string() });
+        }
+        Ok(true)
+      })?;
+    }
     for ((outpoint, sats), hit) in chunk.iter().zip(inscribed) {
       let Some((txid, vout)) = outpoint.split_once(':') else { continue };
       let Ok(vout) = vout.parse::<u32>() else { continue };
@@ -3492,7 +2976,7 @@ pub fn list_unspent_for_address(config: &Config, address: &str) -> Result<Vec<Un
           });
         }
       }
-      let dunes_here = dunes.remove(outpoint).unwrap_or_default();
+      let dunes_here = dunes.remove(outpoint.as_str()).unwrap_or_default();
       out.push(Unspent {
         txid: txid.to_string(),
         vout,
@@ -3527,6 +3011,21 @@ pub struct WalletInscription {
   pub kinds: u32,
   /// For a DRC-20 inscription: its operation and ticker, as inscribed.
   pub drc20: Option<(String, String)>,
+  /// For a TAP inscription (JSON with "p":"tap"): its operation and ticker, as inscribed.
+  pub tap: Option<(String, String)>,
+}
+
+/// TAP operation and ticker of an inscription's content, as inscribed.
+fn tap_op_of(content: &store::Tree, id: &str) -> Result<Option<(String, String)>> {
+  let Some(raw) = content.get(id.as_bytes())? else { return Ok(None) };
+  let c = decode_inscription_content(raw.as_ref())?;
+  if c.body.len() > 4096 { return Ok(None) }
+  let Ok(v) = serde_json::from_slice::<serde_json::Value>(&c.body) else { return Ok(None) };
+  if !v.get("p").and_then(|p| p.as_str()).is_some_and(|p| p.eq_ignore_ascii_case("tap")) { return Ok(None) }
+  match (v.get("op").and_then(|o| o.as_str()), v.get("tick").and_then(|t| t.as_str())) {
+    (Some(op), Some(tick)) => Ok(Some((op.to_ascii_lowercase(), tick.to_string()))),
+    _ => Ok(None),
+  }
 }
 
 /// DRC-20 operation and ticker of an inscription's content, as inscribed.
@@ -3623,6 +3122,7 @@ pub fn list_wallet_inscriptions(
       number,
       kinds: k,
       drc20: if is_drc20(k) { drc20_op_of(&content, id)? } else { None },
+      tap: if !is_drc20(k) && kind_names(k).iter().any(|n| *n == "json" || *n == "text") { tap_op_of(&content, id)? } else { None },
     });
   }
   Ok((total, out))
@@ -3902,28 +3402,10 @@ pub fn dogemap_count_exact(config: &Config) -> Result<u64> {
 pub fn list_dune_holdings(config: &Config, address: &str) -> Result<Vec<DuneHolding>> {
   let db_path = config.db_path();
   let db = open_db(&db_path)?;
-  let outpoints_by_address = db.open_tree("outpoints_by_address")?;
-  let dune_balances_by_outpoint = db.open_tree("dune_balances_by_outpoint")?;
   let dune_meta_by_id = db.open_tree("dune_meta_by_id")?;
 
-  // Walks dune balances and tests ownership, rather than seeking dunes for every
-  // outpoint of the address: see list_spendable_utxos_for_address.
-  let mut aggregate: HashMap<String, u128> = HashMap::new();
-  for d in dune_balances_by_outpoint.scan_prefix(b"")? {
-    let (dk, dv) = d?;
-    let dk = String::from_utf8(dk.to_vec()).context("invalid dune key utf8")?;
-    let (outpoint, dune_id) = dk
-      .split_once('|')
-      .ok_or_else(|| anyhow!("invalid dune balance key"))?;
-    let owner_key = format!("{address}|{outpoint}");
-    if outpoints_by_address.get(owner_key.as_bytes())?.is_none() {
-      continue;
-    }
-    *aggregate.entry(dune_id.to_string()).or_default() += decode_u128(dv.as_ref())?;
-  }
-
   let mut holdings = Vec::new();
-  for (dune_id, balance) in aggregate {
+  for (dune_id, balance) in dunes::dune_holdings(config, address)? {
     if balance == 0 {
       continue;
     }
@@ -4063,6 +3545,10 @@ pub struct DuneSummary {
   pub mints: String,
   pub cap: Option<String>,
   pub limit: Option<String>,
+  /// The protocol id, BLOCK:TX: what edicts and mints refer to.
+  pub dune_id: Option<String>,
+  /// The etching transaction.
+  pub etching: Option<String>,
 }
 
 /// Every etched dune. This is a full scan, so callers should cache.
@@ -4072,6 +3558,7 @@ pub fn list_dunes(config: &Config) -> Result<Vec<DuneSummary>> {
   let dune_meta_by_id = db.open_tree("dune_meta_by_id")?;
   let dune_entry_by_id = db.open_tree("dune_entry_by_id")?;
 
+  let full = dune_entries(config)?;
   let mut out = Vec::new();
   for item in dune_meta_by_id.scan_prefix(b"")? {
     let (k, v) = item?;
@@ -4080,21 +3567,27 @@ pub fn list_dunes(config: &Config) -> Result<Vec<DuneSummary>> {
       continue;
     };
     let entry: DuneEntryLite = bincode::deserialize(raw_entry.as_ref())?;
-    out.push(DuneSummary {
-      id: meta.id,
-      name: meta.name,
-      symbol: meta.symbol,
-      divisibility: meta.divisibility,
-      etched_height: entry.etched_height,
-      premine: entry.premine.to_string(),
-      supply: entry.supply.to_string(),
-      burned: entry.burned.to_string(),
-      mints: entry.mints.to_string(),
-      cap: entry.terms.as_ref().and_then(|t| t.cap).map(|v| v.to_string()),
-      limit: entry.terms.as_ref().and_then(|t| t.limit).map(|v| v.to_string()),
-    });
+    out.push(dune_summary(meta, &entry, full.get(&String::from_utf8_lossy(k.as_ref()).to_string())));
   }
   Ok(out)
+}
+
+fn dune_summary(meta: DuneMeta, entry: &DuneEntryLite, full: Option<&dunes::Entry>) -> DuneSummary {
+  DuneSummary {
+    id: meta.id,
+    name: meta.name,
+    symbol: meta.symbol,
+    divisibility: meta.divisibility,
+    etched_height: entry.etched_height,
+    premine: entry.premine.to_string(),
+    supply: entry.supply.to_string(),
+    burned: entry.burned.to_string(),
+    mints: entry.mints.to_string(),
+    cap: entry.terms.as_ref().and_then(|t| t.cap).map(|v| v.to_string()),
+    limit: entry.terms.as_ref().and_then(|t| t.limit).map(|v| v.to_string()),
+    dune_id: full.map(|e| dunes::format_id(e.id)),
+    etching: full.map(|e| e.etching.clone()),
+  }
 }
 
 /// One DRC-20 holder: raw amounts, scaled by 10^decimals.
@@ -4171,7 +3664,7 @@ pub fn drc20_holders(config: &Config, tick: &str, keep: usize) -> Result<Drc20Ho
   })
 }
 
-/// Full detail for one dune: summary, mint terms and every holder.
+/// Full detail for one dune: summary, mint terms and its largest holders.
 #[derive(Debug, Serialize, Clone)]
 pub struct DuneDetail {
   #[serde(flatten)]
@@ -4180,7 +3673,11 @@ pub struct DuneDetail {
   pub height_end: Option<u64>,
   pub offset_start: Option<u64>,
   pub offset_end: Option<u64>,
+  /// Addresses holding any, all of them.
+  pub holder_count: u64,
+  /// One page of holders, largest first (see `holders_offset`).
   pub holders: Vec<DuneHolderRow>,
+  pub holders_offset: usize,
   /// Units held in unspent outputs, raw.
   pub circulating: String,
 }
@@ -4189,18 +3686,39 @@ pub struct DuneDetail {
 pub struct DuneHolderRow {
   pub address: String,
   pub balance: String,
-  pub outputs: usize,
+  pub outputs: u64,
 }
 
-/// One dune with its holders. Dune balances live on outputs, and few outputs
-/// hold any, so this walks the balance tree and resolves each output's owner.
-pub fn get_dune_detail(config: &Config, dune_id: &str) -> Result<Option<DuneDetail>> {
+/// The explorer id ("DOGECOIN:NAME") of a dune given as that, as its
+/// protocol id (BLOCK:TX), or as its name with or without spacers.
+pub fn resolve_dune_id(config: &Config, wanted: &str) -> Result<Option<String>> {
+  let db = open_db(&config.db_path())?;
+  let metas = db.open_tree("dune_meta_by_id")?;
+  if metas.get(wanted.as_bytes())?.is_some() {
+    return Ok(Some(wanted.to_string()));
+  }
+  if let Some((block, tx)) = wanted.split_once(':')
+    && let (Ok(block), Ok(tx)) = (block.parse::<u64>(), tx.parse::<u32>())
+  {
+    let id = (block as u128) << 16 | tx as u128;
+    return Ok(dune_entries(config)?.into_values().find(|e| e.id == id).map(|e| e.public_id()));
+  }
+  let name: String = wanted
+    .trim_start_matches("DOGECOIN:")
+    .chars()
+    .filter(|c| c.is_ascii_alphabetic())
+    .map(|c| c.to_ascii_uppercase())
+    .collect();
+  let id = format!("DOGECOIN:{name}");
+  Ok(metas.get(id.as_bytes())?.map(|_| id))
+}
+
+/// One dune with a page of its holders, largest first.
+pub fn get_dune_detail(config: &Config, dune_id: &str, offset: usize, limit: usize) -> Result<Option<DuneDetail>> {
   let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let dune_meta_by_id = db.open_tree("dune_meta_by_id")?;
   let dune_entry_by_id = db.open_tree("dune_entry_by_id")?;
-  let dune_balances_by_outpoint = db.open_tree("dune_balances_by_outpoint")?;
-  let utxo_by_outpoint = db.open_tree("utxo_by_outpoint")?;
 
   let Some(raw_meta) = dune_meta_by_id.get(dune_id.as_bytes())? else {
     return Ok(None);
@@ -4212,58 +3730,26 @@ pub fn get_dune_detail(config: &Config, dune_id: &str) -> Result<Option<DuneDeta
   let entry: DuneEntryLite = bincode::deserialize(raw_entry.as_ref())?;
   let terms = entry.terms.clone().unwrap_or_default();
 
-  let mut by_owner: HashMap<String, (u128, usize)> = HashMap::new();
-  let mut circulating: u128 = 0;
-  for item in dune_balances_by_outpoint.scan_prefix(b"")? {
-    let (k, v) = item?;
-    let key = String::from_utf8(k.to_vec()).context("invalid dune key utf8")?;
-    let Some((outpoint, id)) = key.split_once('|') else {
-      continue;
-    };
-    if id != dune_id {
-      continue;
-    }
-    let amount = decode_u128(v.as_ref())?;
-    circulating = circulating.saturating_add(amount);
-    let owner = match utxo_by_outpoint.get(outpoint.as_bytes())? {
-      Some(raw) => bincode::deserialize::<UtxoRecord>(raw.as_ref())
-        .map(|u| u.address)
-        .unwrap_or_default(),
-      None => String::new(),
-    };
-    let slot = by_owner.entry(owner).or_insert((0, 0));
-    slot.0 = slot.0.saturating_add(amount);
-    slot.1 += 1;
-  }
-  let mut ranked: Vec<(u128, String, usize)> = by_owner
-    .into_iter()
-    .map(|(address, (balance, outputs))| (balance, address, outputs))
-    .collect();
-  ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+  let mut ranked = dunes::dune_holders(config, dune_id)?;
+  let circulating = ranked.iter().fold(0u128, |sum, (_, balance, _)| sum.wrapping_add(*balance));
+  ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+  let holder_count = ranked.len() as u64;
   let holders = ranked
     .into_iter()
-    .map(|(balance, address, outputs)| DuneHolderRow { address, balance: balance.to_string(), outputs })
+    .skip(offset)
+    .take(limit)
+    .map(|(address, balance, outputs)| DuneHolderRow { address, balance: balance.to_string(), outputs })
     .collect();
 
   Ok(Some(DuneDetail {
-    summary: DuneSummary {
-      id: meta.id,
-      name: meta.name,
-      symbol: meta.symbol,
-      divisibility: meta.divisibility,
-      etched_height: entry.etched_height,
-      premine: entry.premine.to_string(),
-      supply: entry.supply.to_string(),
-      burned: entry.burned.to_string(),
-      mints: entry.mints.to_string(),
-      cap: terms.cap.map(|v| v.to_string()),
-      limit: terms.limit.map(|v| v.to_string()),
-    },
+    summary: dune_summary(meta, &entry, dune_entry(config, dune_id)?.as_ref()),
     height_start: terms.height_start,
     height_end: terms.height_end,
     offset_start: terms.offset_start,
     offset_end: terms.offset_end,
+    holder_count,
     holders,
+    holders_offset: offset,
     circulating: circulating.to_string(),
   }))
 }
@@ -4314,28 +3800,44 @@ pub fn drc20_holder_counts(config: &Config) -> Result<HashMap<String, u32>> {
   Ok(counts)
 }
 
+/// Unspent outputs of an address per the index: (txid, vout, koinu), in outpoint order.
+pub fn address_outpoints(config: &Config, address: &str) -> Result<Vec<(String, u32, u64)>> {
+  let db = open_db(&config.db_path())?;
+  let prefix = format!("{address}|");
+  let mut out = Vec::new();
+  db.open_tree("outpoints_by_address")?.for_each_prefix(prefix.as_bytes(), |k, v| {
+    let outpoint = std::str::from_utf8(&k[prefix.len()..]).context("outpoint utf8")?;
+    if let Some((txid, vout)) = outpoint.split_once(':')
+      && let Ok(vout) = vout.parse::<u32>()
+    {
+      out.push((txid.to_string(), vout, decode_u64(v)?));
+    }
+    Ok(true)
+  })?;
+  Ok(out)
+}
+
+/// The transaction that spends `txid:vout` and which of its inputs does, with
+/// its height, looking in blocks `from..=to`. There is no spend index: this is
+/// for following inscription reveal chains, which go on within a few blocks.
+pub async fn find_spender(config: &Config, txid: &str, vout: u32, from: u64, to: u64) -> Result<Option<(String, usize, u64)>> {
+  let client = indexer_rpc_client()?;
+  for h in from..=to {
+    let block = repair::fetch_block(client, config, h).await?;
+    for tx in &block.tx {
+      for (i, vin) in tx.vin.iter().enumerate() {
+        if vin.vout == Some(vout) && vin.txid.as_deref() == Some(txid) {
+          return Ok(Some((tx.txid.clone(), i, h)));
+        }
+      }
+    }
+  }
+  Ok(None)
+}
+
 /// Holder count for every dune: distinct owners of the outputs holding it.
 pub fn dune_holder_counts(config: &Config) -> Result<HashMap<String, u32>> {
-  let db = open_db(&config.db_path())?;
-  let balances = db.open_tree("dune_balances_by_outpoint")?;
-  let utxos = db.open_tree("utxo_by_outpoint")?;
-  let mut owners: HashMap<String, HashSet<String>> = HashMap::new();
-  for item in balances.scan_prefix(b"")? {
-    let (k, v) = item?;
-    if decode_u128(v.as_ref())? == 0 {
-      continue;
-    }
-    let key = String::from_utf8(k.to_vec()).context("invalid dune key utf8")?;
-    let Some((outpoint, dune_id)) = key.split_once('|') else {
-      continue;
-    };
-    let owner = match utxos.get(outpoint.as_bytes())? {
-      Some(raw) => bincode::deserialize::<UtxoRecord>(raw.as_ref()).map(|u| u.address).unwrap_or_default(),
-      None => String::new(),
-    };
-    owners.entry(dune_id.to_string()).or_default().insert(owner);
-  }
-  Ok(owners.into_iter().map(|(id, set)| (id, set.len() as u32)).collect())
+  dunes::dune_owner_counts(config)
 }
 
 /// Where a dune was etched, read back from the etching block.
@@ -4363,47 +3865,36 @@ fn vout_address(vout: &RpcVout) -> Option<String> {
   vout.script_pub_key.addresses.as_ref().and_then(|a| a.first()).cloned()
 }
 
-/// Finds the transaction that etched `dune_id` in block `etched_height`,
-/// using the same name derivation as indexing: an explicit name, or the
-/// height and position of the etching transaction.
-pub async fn find_dune_etching(config: &Config, dune_id: &str, etched_height: u64) -> Result<Option<DuneEtching>> {
+/// The transaction that etched `dune_id`, from the index's record of it, and
+/// where its premine went: the premine is an edict to output 1, so when it
+/// is the only id-0 edict that output got it all.
+pub async fn find_dune_etching(config: &Config, dune_id: &str, _etched_height: u64) -> Result<Option<DuneEtching>> {
+  let Some(entry) = dune_entries(config)?.remove(dune_id) else {
+    return Ok(None);
+  };
   let client = indexer_rpc_client()?;
-  let hash: String = rpc_call(client, config, "getblockhash", serde_json::json!([etched_height])).await?;
-  let block: RpcBlock = rpc_call(client, config, "getblock", serde_json::json!([hash, 2])).await?;
-  for (tx_index, tx) in block.tx.iter().enumerate() {
-    let Some(stone) = parse_dunestone(tx) else {
-      continue;
-    };
-    let Some(etch) = stone.etching.as_ref() else {
-      continue;
-    };
-    let numeric = etch
-      .dune
-      .unwrap_or_else(|| ((etched_height as u128) << 16) | (tx_index as u128 & 0xFFFF));
-    if format!("DOGECOIN:{}", dune_name(numeric)) != dune_id {
-      continue;
+  let tx: RpcTx = rpc_call(client, config, "getrawtransaction", serde_json::json!([entry.etching, true])).await?;
+  let stone = dunes::Stone::from_tx(&tx).unwrap_or_default();
+  let only_premine = stone.edicts.iter().filter(|e| e.id == 0).count() == 1;
+  let to = tx.vout.get(1);
+  let premine_burned = entry.premine > 0 && (stone.cenotaph || to.is_some_and(is_op_return_any));
+  let premine_to = (entry.premine > 0 && only_premine && !premine_burned).then(|| to.and_then(vout_address)).flatten();
+  let etched_by = match (tx.vin.first().and_then(|v| v.txid.clone()), tx.vin.first().and_then(|v| v.vout)) {
+    (Some(prev), Some(n)) => {
+      let prev_tx: RpcTx = rpc_call(client, config, "getrawtransaction", serde_json::json!([prev, true])).await?;
+      prev_tx.vout.iter().find(|o| o.n == n).and_then(vout_address)
     }
-    let premine_burned = stone.cenotaph && etch.premine > 0;
-    let split = stone.edicts.iter().any(|(id, _, _)| *id == 0);
-    let premine_to = if etch.premine == 0 || stone.cenotaph || split {
-      None
-    } else {
-      stone
-        .pointer
-        .filter(|p| *p < tx.vout.len())
-        .or_else(|| tx.vout.iter().position(|v| !is_op_return(v)))
-        .and_then(|i| vout_address(&tx.vout[i]))
-    };
-    let etched_by = match (tx.vin.first().and_then(|v| v.txid.clone()), tx.vin.first().and_then(|v| v.vout)) {
-      (Some(prev), Some(n)) => {
-        let prev_tx: RpcTx = rpc_call(client, config, "getrawtransaction", serde_json::json!([prev, true])).await?;
-        prev_tx.vout.iter().find(|o| o.n == n).and_then(vout_address)
-      }
-      _ => None,
-    };
-    return Ok(Some(DuneEtching { txid: tx.txid.clone(), time: block.time.unwrap_or(0), etched_by, premine_to, premine_burned }));
+    _ => None,
+  };
+  Ok(Some(DuneEtching { txid: tx.txid.clone(), time: entry.timestamp, etched_by, premine_to, premine_burned }))
+}
+
+/// OP_RETURN by script bytes when the node gave them, else by asm.
+fn is_op_return_any(vout: &RpcVout) -> bool {
+  match vout.script_pub_key.hex.as_deref() {
+    Some(h) => h.starts_with("6a"),
+    None => is_op_return(vout),
   }
-  Ok(None)
 }
 
 const DEPLOY_BACKFILL_KEY: &[u8] = b"drc20_deploy_backfill_v1";
@@ -4872,56 +4363,6 @@ mod tests {
     store::Db::temporary().expect("open temp rocksdb")
   }
 
-  fn enc_varint(mut n: u128) -> Vec<u8> {
-    let mut out = [0u8; 19];
-    let mut i = 18usize;
-    loop {
-      let mut byte = n.to_le_bytes()[0] & 0b0111_1111;
-      if i < 18 {
-        byte |= 0b1000_0000;
-      }
-      out[i] = byte;
-      if n < 0b1000_0000 {
-        break;
-      }
-      n = n / 128 - 1;
-      i = i.saturating_sub(1);
-    }
-    out[i..].to_vec()
-  }
-
-  fn dune_asm(integers: &[u128]) -> String {
-    let mut payload = Vec::new();
-    for n in integers {
-      payload.extend_from_slice(&enc_varint(*n));
-    }
-    format!("OP_RETURN 44 {}", hex::encode(payload))
-  }
-
-  fn p2pkh_like_output(n: u32, value: f64, address: &str) -> RpcVout {
-    RpcVout {
-      value,
-      n,
-      script_pub_key: RpcScriptPubKey {
-        asm: Some("OP_DUP OP_HASH160".to_string()),
-        hex: None,
-        addresses: Some(vec![address.to_string()]),
-      },
-    }
-  }
-
-  fn op_return_output(n: u32, asm: String) -> RpcVout {
-    RpcVout {
-      value: 0.0,
-      n,
-      script_pub_key: RpcScriptPubKey {
-        asm: Some(asm),
-        hex: None,
-        addresses: None,
-      },
-    }
-  }
-
   fn get_balance(tree: &store::Tree, address: &str, tick: &str) -> Drc20Balance {
     let k = balance_key(address, tick);
     let raw = tree.get(k.as_bytes()).unwrap().unwrap();
@@ -4945,93 +4386,6 @@ mod tests {
       script.push(op);
     }
     script
-  }
-
-  #[test]
-  fn dunes_premine_allocates_to_default_output() {
-    let db = test_db();
-    let dune_meta = db.open_tree("dune_meta_by_id").unwrap();
-    let dune_entry = db.open_tree("dune_entry_by_id").unwrap();
-    let dune_balances = db.open_tree("dune_balances_by_outpoint").unwrap();
-    let mut undo = UndoRecorder::default();
-
-    let tx = RpcTx {
-      txid: "txpremine".to_string(),
-      vin: vec![],
-      vout: vec![
-        op_return_output(0, dune_asm(&[2, 1, 4, 1, 22, 50])),
-        p2pkh_like_output(1, 1.0, "DADDR1"),
-      ],
-    };
-
-    process_dunes(
-      &tx,
-      1,
-      5_084_000,
-      &dune_meta,
-      &dune_entry,
-      &dune_balances,
-      &mut undo,
-      &mut Vec::new(),
-    )
-    .unwrap();
-
-    let dune_id = "DOGECOIN:B";
-    let meta_raw = dune_meta.get(dune_id.as_bytes()).unwrap().unwrap();
-    let meta: DuneMeta = bincode::deserialize(meta_raw.as_ref()).unwrap();
-    assert_eq!(meta.id, dune_id);
-
-    let bal_key = "txpremine:1|DOGECOIN:B";
-    let bal_raw = dune_balances.get(bal_key.as_bytes()).unwrap().unwrap();
-    assert_eq!(decode_u128(bal_raw.as_ref()).unwrap(), 50);
-  }
-
-  #[test]
-  fn dunes_cenotaph_burns_unallocated_inputs() {
-    let db = test_db();
-    let dune_meta = db.open_tree("dune_meta_by_id").unwrap();
-    let dune_entry = db.open_tree("dune_entry_by_id").unwrap();
-    let dune_balances = db.open_tree("dune_balances_by_outpoint").unwrap();
-    let mut undo = UndoRecorder::default();
-
-    dune_balances
-      .insert("prevtx:0|DOGECOIN:B".as_bytes(), encode_u128(100).to_vec())
-      .unwrap();
-
-    // Body with output=9 while tx has only 2 outputs => cenotaph.
-    let tx = RpcTx {
-      txid: "txburn".to_string(),
-      vin: vec![RpcVin {
-        txid: Some("prevtx".to_string()),
-        vout: Some(0),
-        script_sig: None,
-      }],
-      vout: vec![
-        op_return_output(0, dune_asm(&[0, 0, 10, 9])),
-        p2pkh_like_output(1, 1.0, "DADDR1"),
-      ],
-    };
-
-    process_dunes(
-      &tx,
-      0,
-      5_084_001,
-      &dune_meta,
-      &dune_entry,
-      &dune_balances,
-      &mut undo,
-      &mut Vec::new(),
-    )
-    .unwrap();
-
-    assert!(dune_balances
-      .get("prevtx:0|DOGECOIN:B".as_bytes())
-      .unwrap()
-      .is_none());
-    assert!(dune_balances
-      .scan_prefix("txburn:".as_bytes())
-      .unwrap()
-      .is_empty());
   }
 
   #[test]
@@ -5067,75 +4421,6 @@ mod tests {
     );
   }
 
-  #[test]
-  fn dunes_claim_mints_and_updates_supply() {
-    let db = test_db();
-    let dune_meta = db.open_tree("dune_meta_by_id").unwrap();
-    let dune_entry = db.open_tree("dune_entry_by_id").unwrap();
-    let dune_balances = db.open_tree("dune_balances_by_outpoint").unwrap();
-    let mut undo = UndoRecorder::default();
-
-    let dune_id = "DOGECOIN:B";
-    let meta = DuneMeta {
-      id: dune_id.to_string(),
-      name: "B".to_string(),
-      symbol: String::new(),
-      divisibility: 0,
-    };
-    let entry = DuneEntryLite {
-      id: dune_id.to_string(),
-      etched_height: 5_084_000,
-      premine: 0,
-      supply: 0,
-      burned: 0,
-      mints: 0,
-      terms: Some(DuneTerms {
-        cap: Some(2),
-        limit: Some(100),
-        height_start: None,
-        height_end: None,
-        offset_start: None,
-        offset_end: None,
-      }),
-    };
-    dune_meta
-      .insert(dune_id.as_bytes(), bincode::serialize(&meta).unwrap())
-      .unwrap();
-    dune_entry
-      .insert(dune_id.as_bytes(), bincode::serialize(&entry).unwrap())
-      .unwrap();
-
-    let claim_id = 1u128 | DUNE_CLAIM_BIT;
-    let tx = RpcTx {
-      txid: "txclaim".to_string(),
-      vin: vec![],
-      vout: vec![
-        op_return_output(0, dune_asm(&[0, claim_id, 30, 1])),
-        p2pkh_like_output(1, 1.0, "DADDR1"),
-      ],
-    };
-
-    process_dunes(
-      &tx,
-      0,
-      5_084_010,
-      &dune_meta,
-      &dune_entry,
-      &dune_balances,
-      &mut undo,
-      &mut Vec::new(),
-    )
-    .unwrap();
-
-    let bal_key = "txclaim:1|DOGECOIN:B";
-    let bal_raw = dune_balances.get(bal_key.as_bytes()).unwrap().unwrap();
-    assert_eq!(decode_u128(bal_raw.as_ref()).unwrap(), 30);
-
-    let entry_raw = dune_entry.get(dune_id.as_bytes()).unwrap().unwrap();
-    let updated: DuneEntryLite = bincode::deserialize(entry_raw.as_ref()).unwrap();
-    assert_eq!(updated.supply, 30);
-    assert_eq!(updated.mints, 1);
-  }
 
   #[test]
   fn drc20_deploy_mint_transfer_lifecycle() {
@@ -5839,6 +5124,8 @@ mod tests {
     drop(balances);
     drop(utxos);
 
+    // Holder rows, as the live index keeps them, built from these balances.
+    dunes::build_holders(&db).unwrap();
     db.flush().unwrap();
     drop(insc_by_outpoint);
     drop(dune_by_outpoint);
@@ -5884,14 +5171,20 @@ mod tests {
     assert_eq!(drc20_holders(&cfg, "NONE", 500).unwrap().holders, 0);
 
     // Dune detail: owners resolved through their outputs, largest first.
-    let d = get_dune_detail(&cfg, "DOGECOIN:TEST").unwrap().expect("dune exists");
+    let d = get_dune_detail(&cfg, "DOGECOIN:TEST", 0, 500).unwrap().expect("dune exists");
+    assert_eq!(d.holder_count, 2);
+    assert_eq!(get_dune_detail(&cfg, "DOGECOIN:TEST", 1, 1).unwrap().unwrap().holders[0].address, "DOTHER");
+    assert_eq!(resolve_dune_id(&cfg, "test").unwrap().as_deref(), Some("DOGECOIN:TEST"));
+    assert_eq!(dune_holder_counts(&cfg).unwrap().get("DOGECOIN:TEST"), Some(&2));
+    let held = list_dune_holdings(&cfg, "DADDR").unwrap();
+    assert_eq!((held.len(), held[0].balance.as_str()), (1, "55"));
     assert_eq!(d.summary.name, "TEST•DUNE");
     assert_eq!(d.summary.cap.as_deref(), Some("10"));
     assert_eq!((d.height_end, d.offset_start), (Some(500), Some(5)));
     assert_eq!(d.circulating, "100");
     let holders: Vec<(&str, &str)> = d.holders.iter().map(|x| (x.address.as_str(), x.balance.as_str())).collect();
     assert_eq!(holders, vec![("DADDR", "55"), ("DOTHER", "45")]);
-    assert!(get_dune_detail(&cfg, "DOGECOIN:MISSING").unwrap().is_none());
+    assert!(get_dune_detail(&cfg, "DOGECOIN:MISSING", 0, 500).unwrap().is_none());
   }
 
   #[test]
@@ -5904,6 +5197,45 @@ mod tests {
     assert_eq!(validate_drc20_deploy("0", None, Some("0")), None, "zero supply");
     assert_eq!(validate_drc20_deploy("10", Some("0"), Some("0")), None, "zero limit");
     assert_eq!(validate_drc20_deploy("ten", None, Some("0")), None, "not a number");
+    // Max and lim are capped at u64::MAX whole tokens, as in ord-dogecoin.
+    let max = u128::from(u64::MAX);
+    assert_eq!(validate_drc20_deploy("18446744073709551615", None, None), Some((max * e18, max * e18, 18)));
+    assert_eq!(validate_drc20_deploy("18446744073709551616", Some("1"), None), None, "max over the cap");
+    assert_eq!(validate_drc20_deploy("69696969696969696969", Some("696969696969"), None), None, "BOOB's first deploy");
+    assert_eq!(validate_drc20_deploy("100", Some("18446744073709551616"), Some("0")), None, "lim over the cap");
+    assert_eq!(validate_drc20_deploy("18446744073709551615.5", Some("1"), Some("1")), None, "a fraction over the cap");
+  }
+
+  #[test]
+  fn ticks_match_without_regard_to_case() {
+    assert_eq!(canonical_tick("boob").unwrap(), "BOOB");
+    assert_eq!(canonical_tick("PS2!").unwrap(), "PS2!");
+    // Unicode letters fold too: φOG and ΦOG are one tick.
+    assert_eq!(canonical_tick("φOG").unwrap(), canonical_tick("ΦOG").unwrap());
+    assert_eq!(canonical_tick("ΦOG").unwrap(), "φOG");
+    assert!(canonical_tick("boobs").is_err());
+  }
+
+  #[test]
+  fn an_invalid_first_deploy_leaves_the_tick_free() {
+    let db = test_db();
+    let token_tree = db.open_tree("drc20_token_info").unwrap();
+    let balance_tree = db.open_tree("drc20_balance").unwrap();
+    let transferable_tree = db.open_tree("drc20_transferable_by_id").unwrap();
+    let deploy = |id: &str, max: &str, lim: &str| {
+      let action = Drc20Action::Deploy {
+        tick: "boob".to_string(),
+        max_supply: max.to_string(),
+        mint_limit: Some(lim.to_string()),
+        decimals: None,
+      };
+      apply_drc20_new_action_with_undo(&token_tree, &balance_tree, &transferable_tree, "DADDR1", id, action, None).unwrap()
+    };
+    assert!(deploy("first", "69696969696969696969", "696969696969").is_none(), "over the cap");
+    assert!(deploy("second", "21000000", "1000").is_some(), "the first valid deploy wins");
+    let info: Drc20TokenInfo = bincode::deserialize(token_tree.get(token_key("BOOB").as_bytes()).unwrap().unwrap().as_ref()).unwrap();
+    assert_eq!(info.supply, 21_000_000 * 10u128.pow(18));
+    assert_eq!(info.limit_per_mint, 1000 * 10u128.pow(18));
   }
 
   #[test]
@@ -5938,32 +5270,6 @@ mod tests {
     let moved = process_drc20_transfer_move_with_undo(&balance_tree, &transferable_tree, "t0", "DB", None).unwrap();
     assert_eq!(moved, Some(Drc20Moved { tick: "WXYZ".into(), amount: 40, from: "DA".into(), to: "DB".into() }));
     assert_eq!(process_drc20_transfer_move_with_undo(&balance_tree, &transferable_tree, "t0", "DB", None).unwrap(), None, "a lock moves once");
-  }
-
-  #[test]
-  fn dune_events_report_etch_mint_transfer_and_burn() {
-    let db = test_db();
-    let meta = db.open_tree("dune_meta_by_id").unwrap();
-    let entry = db.open_tree("dune_entry_by_id").unwrap();
-    let balances = db.open_tree("dune_balances_by_outpoint").unwrap();
-    let mut undo = UndoRecorder::default();
-
-    // A pre-existing dune on an output this test spends.
-    balances.insert(b"txprev:0|DOGECOIN:B", encode_u128(70).to_vec()).unwrap();
-    let mut events = Vec::new();
-    let spend = RpcTx {
-      txid: "txspend".into(),
-      vin: vec![RpcVin { txid: Some("txprev".into()), vout: Some(0), script_sig: None }],
-      vout: vec![p2pkh_like_output(0, 1.0, "DADDR2")],
-    };
-    process_dunes(&spend, 0, 5_100_000, &meta, &entry, &balances, &mut undo, &mut events).unwrap();
-    assert_eq!(events, vec![DuneEvent { dune_id: "DOGECOIN:B".into(), kind: "transfer", amount: 70 }]);
-
-    // A transaction moving nothing reports nothing.
-    let mut quiet = Vec::new();
-    let plain = RpcTx { txid: "txplain".into(), vin: vec![], vout: vec![p2pkh_like_output(0, 1.0, "DADDR3")] };
-    process_dunes(&plain, 0, 5_100_001, &meta, &entry, &balances, &mut undo, &mut quiet).unwrap();
-    assert!(quiet.is_empty());
   }
 
   #[test]
