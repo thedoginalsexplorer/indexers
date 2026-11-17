@@ -44,7 +44,7 @@ DOGEORD_DATA_DIR=./data \
 ./target/release/doginals-indexer
 ```
 
-Ctrl-C stops it after the current block and flushes the index (it waits up to two minutes). It resumes where it left off.
+Ctrl-C stops it after the current block and flushes the index (it waits up to two minutes). It resumes where it left off. To skip the weeks a first sync takes, start from a [bootstrap](#bootstrap-start-from-a-finished-index).
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -63,6 +63,43 @@ Ctrl-C stops it after the current block and flushes the index (it waits up to tw
 Each setting also works with the old `SPOOKY_` prefix from SpookyOrd. An index SpookyOrd made (`spookyord.rocksdb`) is used where it is.
 
 Set `RUST_LOG` (for example `RUST_LOG=info`) to change how much is logged.
+
+## Bootstrap: start from a finished index
+
+A full index takes weeks: the main sync, then the DRC-20, Dune and numbering passes. A bootstrap is a finished index at some block, packed for download. Apply it, start the indexer, and it carries on from the next block. Only the RocksDB store is in a bootstrap, nothing else from the data directory.
+
+### Using one
+
+```bash
+# 1. download every part (resumes if interrupted, checks each SHA-256)
+./target/release/doginals-indexer bootstrap download https://example.com/bootstrap/ ./bootstrap
+
+# 2. check it against your node and unpack it (DOGEORD_DATA_DIR must not hold an index yet)
+DOGEORD_DATA_DIR=./data ./target/release/doginals-indexer bootstrap apply ./bootstrap
+
+# 3. carry on indexing from the next block
+DOGEORD_DATA_DIR=./data ./target/release/doginals-indexer
+```
+
+`apply` asks your node for the bootstrap's last block and refuses if the hash differs. It checks every part's hash as it unpacks, and reads the unpacked index back to confirm where it ends. If your node is still syncing below that block, it can't confirm the hash yet and says so. Let the node sync past it before starting the indexer. `apply` also takes the web address directly and streams the parts without storing them. That needs less disk, but an interrupted download starts over. `bootstrap verify ./bootstrap` re-checks downloaded parts.
+
+You need room for the unpacked index (`unpacked_bytes` in `bootstrap.json`), plus the parts if you download them first.
+
+### Making one
+
+```bash
+# 1. a consistent copy of the index, ending at a block
+DOGEORD_DATA_DIR=./data ./target/release/doginals-indexer bootstrap snapshot /big/disk/snap
+
+# 2. compress it into parts (default 1900 MiB each) plus bootstrap.json
+./target/release/doginals-indexer bootstrap pack /big/disk/snap /big/disk/bootstrap
+
+# 3. upload everything in /big/disk/bootstrap to one folder on a web host; delete /big/disk/snap
+```
+
+If an indexer is running on that data directory, `snapshot` asks it for the copy: the indexer takes it between two blocks, right after a flush, so it never stops. Put the snapshot on the same drive as the index. RocksDB then hard-links the table files, which takes seconds; on another drive it copies them, and indexing waits until that's done. Delete the snapshot once packed: its hard links keep old table files on disk after the live index compacts them away.
+
+`bootstrap.json` records the chain, the last block's height and hash, which one-off passes are done (so they don't run again), the unpacked size, and each part's name, size and SHA-256. Parts are numbered pieces of one zstd-compressed tar stream (`--part-mb` and `--level` change the size and compression level).
 
 ### Rolling back
 

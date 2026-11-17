@@ -8,6 +8,7 @@ mod drc20_replay;
 mod dfeed;
 mod dunes;
 mod dune_replay;
+pub mod bootstrap;
 
 pub use dns::{
   ClaimEntry, DnsConfigView, DnsListed, DnsName, DnsNameView, DnsPage, DnsRecords, DnsRole, DnsStatus, DnsSupply, dns_claims,
@@ -764,6 +765,7 @@ pub async fn run_indexer(
   let info: BlockchainInfo = rpc_call(&client, &config, "getblockchaininfo", serde_json::json!([])).await?;
   state.set_network(info.chain.clone()).await;
   state.set_tip(info.blocks).await;
+  let chain_name = info.chain.clone();
 
   let protocol_start = config.protocol_start_height();
   state.set_protocol_start_height(protocol_start).await;
@@ -1095,6 +1097,9 @@ pub async fn run_indexer(
 
       db.flush()?;
       blocks_since_flush = 0;
+      // A bootstrap snapshot asked for with a `snapshot-to` file: taken here,
+      // between blocks and right after a flush, so it ends exactly at this one.
+      bootstrap::serve_snapshot_request(&config, &db, &chain_name, next_height, &block.hash);
     }
     blocks_since_tip_refresh += 1;
     PHASE_COMMIT_NS.fetch_add(commit_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);

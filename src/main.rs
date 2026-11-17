@@ -1,9 +1,12 @@
-//! Runs every indexer against a Dogecoin Core node, with no web server.
+//! Runs every indexer against a Dogecoin Core node, with no web server, and
+//! makes or applies bootstraps (a finished index to start from).
 //!
 //! Settings come from the environment (see the README). The index is written
 //! to `DOGEORD_DATA_DIR`; read it with the `dogeord-indexer` library.
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use dogeord_indexer::bootstrap;
+use std::path::Path;
 use dogeord_core::Config;
 use dogeord_indexer::{SharedState, run_indexer};
 use std::time::Duration;
@@ -11,12 +14,99 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const USAGE: &str = "doginals-indexer                     index (the default; Ctrl-C stops after the current block)
+doginals-indexer bootstrap snapshot <dir>
+    copy the index in DOGEORD_DATA_DIR to <dir>, ending at a block. With an indexer
+    running there, it takes the copy itself after its next flush, without stopping.
+doginals-indexer bootstrap pack <snapshot-dir> <out-dir> [--part-mb N] [--level N]
+    compress a snapshot into parts (default 1900 MiB each, zstd level 3) plus bootstrap.json
+doginals-indexer bootstrap download <url> <dir>
+    fetch bootstrap.json and every part from <url>, resuming, checking each SHA-256
+doginals-indexer bootstrap verify <dir>
+    check downloaded parts against bootstrap.json
+doginals-indexer bootstrap apply <dir|url> [--skip-node-check]
+    check the snapshot's block against your node and unpack it into DOGEORD_DATA_DIR";
+
+fn main() -> Result<()> {
   tracing_subscriber::fmt()
     .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
     .init();
 
+  let args: Vec<String> = std::env::args().skip(1).collect();
+  match args.first().map(String::as_str) {
+    None | Some("run") => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run()),
+    Some("bootstrap") => bootstrap_command(&args[1..]),
+    Some("-h" | "--help" | "help") => {
+      println!("{USAGE}");
+      Ok(())
+    }
+    Some(other) => bail!("unknown command {other:?}
+
+{USAGE}"),
+  }
+}
+
+/// `--name value` from `args`, parsed.
+fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>> {
+  match args.iter().position(|a| a == name) {
+    None => Ok(None),
+    Some(i) => {
+      let v = args.get(i + 1).with_context(|| format!("{name} needs a value"))?;
+      v.parse().map(Some).map_err(|_| anyhow::anyhow!("{name}: bad value {v:?}"))
+    }
+  }
+}
+
+fn bootstrap_command(args: &[String]) -> Result<()> {
+  let cfg = Config::from_env();
+  let pos: Vec<&str> = {
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+      if args[i] == "--part-mb" || args[i] == "--level" {
+        i += 2;
+        continue;
+      }
+      if !args[i].starts_with("--") {
+        v.push(args[i].as_str());
+      }
+      i += 1;
+    }
+    v
+  };
+  match pos.as_slice() {
+    ["snapshot", dir] => {
+      let info = bootstrap::snapshot(&cfg, Path::new(dir), Duration::from_secs(15 * 60))?;
+      println!("snapshot of block {} ({}) in {dir}", info.height, info.block_hash);
+    }
+    ["pack", snap, out] => {
+      let part_mb: u64 = flag(args, "--part-mb")?.unwrap_or(bootstrap::DEFAULT_PART_BYTES >> 20);
+      let level: i32 = flag(args, "--level")?.unwrap_or(3);
+      let m = bootstrap::pack(Path::new(snap), Path::new(out), part_mb << 20, level)?;
+      println!("{} parts and {} in {out}; upload them all to one folder", m.parts.len(), bootstrap::MANIFEST_FILE);
+    }
+    ["download", url, dir] => {
+      let m = bootstrap::download(url, Path::new(dir))?;
+      println!("block {} downloaded and checked in {dir}; now: doginals-indexer bootstrap apply {dir}", m.info.height);
+    }
+    ["verify", dir] => {
+      let bad = bootstrap::verify(Path::new(dir))?;
+      if !bad.is_empty() {
+        bail!("{} part(s) do not match: {}", bad.len(), bad.join(", "));
+      }
+      println!("every part matches {}", bootstrap::MANIFEST_FILE);
+    }
+    ["apply", src] => {
+      let opts = bootstrap::ApplyOptions { skip_node_check: args.iter().any(|a| a == "--skip-node-check") };
+      let info = bootstrap::apply(&cfg, src, &opts)?;
+      println!("index in place at block {}; start doginals-indexer to carry on", info.height);
+    }
+    _ => bail!("{USAGE}"),
+  }
+  Ok(())
+}
+
+async fn run() -> Result<()> {
   let cfg = Config::from_env();
   std::fs::create_dir_all(&cfg.data_dir)?;
   info!("indexing from {} into {}", cfg.rpc_url, cfg.data_dir);

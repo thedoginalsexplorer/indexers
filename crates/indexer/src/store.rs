@@ -320,6 +320,16 @@ impl Db {
     Ok(())
   }
 
+  /// A consistent copy of the whole store at this moment, every column family
+  /// included, written to `dir` (which must not exist yet). On the same drive
+  /// the table files are hard links, so it takes seconds and little space at
+  /// first; on another drive they are copied.
+  pub fn checkpoint(&self, dir: &Path) -> Result<()> {
+    let cp = rocksdb::checkpoint::Checkpoint::new(&*self.inner).context("start rocksdb checkpoint")?;
+    cp.create_checkpoint(dir).with_context(|| format!("write rocksdb checkpoint to {}", dir.display()))?;
+    Ok(())
+  }
+
   /// Rewrites every column family from scratch.
   ///
   /// Table options such as bloom filters are baked into an SST when it is
