@@ -3061,48 +3061,12 @@ pub fn list_wallet_inscriptions(
   let genesis = db.open_tree("inscription_genesis")?;
   let content = db.open_tree("inscription_content")?;
 
-  let prefix = format!("{address}|");
-  let mut ids = Vec::new();
-  for item in by_address.scan_prefix(prefix.as_bytes())? {
-    let (k, _v) = item?;
-    let key = String::from_utf8(k.to_vec()).context("invalid inscriptions_by_address key utf8")?;
-    if let Some((_, id)) = key.split_once('|') {
-      ids.push(id.to_string());
-    }
-  }
-  ids.sort();
-  ids.reverse();
-
-  // Kinds come from numbering; one not numbered yet is classified from its
-  // content, as numbering would.
-  let kinds_of_ids = |ids: &[String]| -> Result<Vec<(u32, Option<u64>)>> {
-    let mut out = Vec::with_capacity(ids.len());
-    for chunk in ids.chunks(4096) {
-      for (id, raw) in chunk.iter().zip(genesis.multi_get(chunk)?) {
-        out.push(match raw {
-          Some(r) => {
-            let g: insc_index::Genesis = bincode::deserialize(r.as_ref()).context("decode genesis")?;
-            (g.kinds, Some(g.number))
-          }
-          None => match content.get(id.as_bytes())? {
-            Some(r) => {
-              let c = decode_inscription_content(r.as_ref())?;
-              (kinds_of(&c.content_type, Some(&c.body)), None)
-            }
-            None => (0, None),
-          },
-        });
-      }
-    }
-    Ok(out)
-  };
-  let is_drc20 = |kinds: u32| kind_names(kinds).contains(&"drc20");
-
+  let mut ids = wallet_ids(&by_address, address)?;
   if exclude != WalletExclude::Nothing {
-    let kinds = kinds_of_ids(&ids)?;
+    let kinds = wallet_kinds_of(&genesis, &content, &ids)?;
     let mut kept = Vec::with_capacity(ids.len());
     for (id, (k, _)) in ids.into_iter().zip(kinds) {
-      let drop = is_drc20(k)
+      let drop = wallet_is_drc20(k)
         && match exclude {
           WalletExclude::Drc20 => true,
           _ => drc20_op_of(&content, &id)?.is_some_and(|(op, _)| op == "transfer"),
@@ -3117,20 +3081,92 @@ pub fn list_wallet_inscriptions(
   let total = ids.len();
   let start = page.saturating_sub(1).saturating_mul(limit).min(total);
   let end = start.saturating_add(limit).min(total);
-  let page_ids = &ids[start..end];
-  let kinds = kinds_of_ids(page_ids)?;
-  let mut out = Vec::with_capacity(page_ids.len());
-  for (id, (k, number)) in page_ids.iter().zip(kinds) {
+  let out = wallet_items(&by_id, &genesis, &content, &ids[start..end])?;
+  Ok((total, out))
+}
+
+/// Every inscription id an address holds, in the order [`list_wallet_inscriptions`]
+/// lists them. Only the address index is read, so it is quick for any wallet size.
+pub fn list_wallet_inscription_ids(config: &Config, address: &str) -> Result<Vec<String>> {
+  let db = open_db(&config.db_path())?;
+  let by_address = db.open_tree("inscriptions_by_address")?;
+  wallet_ids(&by_address, address)
+}
+
+/// The listed records of `ids` that `address` holds now, in the order given;
+/// ids it doesn't hold are left out.
+pub fn wallet_inscriptions_by_ids(config: &Config, address: &str, ids: &[String]) -> Result<Vec<WalletInscription>> {
+  let db = open_db(&config.db_path())?;
+  let by_address = db.open_tree("inscriptions_by_address")?;
+  let by_id = db.open_tree("inscriptions_by_id")?;
+  let genesis = db.open_tree("inscription_genesis")?;
+  let content = db.open_tree("inscription_content")?;
+  let keys: Vec<String> = ids.iter().map(|id| format!("{address}|{id}")).collect();
+  let held: Vec<String> = ids.iter().zip(by_address.multi_get(&keys)?).filter(|(_, v)| v.is_some()).map(|(id, _)| id.clone()).collect();
+  // The address index and the records are read apart, and a block may be indexed in between:
+  // keep only records that still name this address, so a just-moved inscription isn't listed.
+  let mut items = wallet_items(&by_id, &genesis, &content, &held)?;
+  items.retain(|w| w.rec.address == address);
+  Ok(items)
+}
+
+fn wallet_ids(by_address: &store::Tree, address: &str) -> Result<Vec<String>> {
+  let prefix = format!("{address}|");
+  let mut ids = Vec::new();
+  for item in by_address.scan_prefix(prefix.as_bytes())? {
+    let (k, _v) = item?;
+    let key = String::from_utf8(k.to_vec()).context("invalid inscriptions_by_address key utf8")?;
+    if let Some((_, id)) = key.split_once('|') {
+      ids.push(id.to_string());
+    }
+  }
+  ids.sort();
+  ids.reverse();
+  Ok(ids)
+}
+
+fn wallet_is_drc20(kinds: u32) -> bool {
+  kind_names(kinds).contains(&"drc20")
+}
+
+/// Kinds come from numbering; one not numbered yet is classified from its
+/// content, as numbering would.
+fn wallet_kinds_of(genesis: &store::Tree, content: &store::Tree, ids: &[String]) -> Result<Vec<(u32, Option<u64>)>> {
+  let mut out = Vec::with_capacity(ids.len());
+  for chunk in ids.chunks(4096) {
+    for (id, raw) in chunk.iter().zip(genesis.multi_get(chunk)?) {
+      out.push(match raw {
+        Some(r) => {
+          let g: insc_index::Genesis = bincode::deserialize(r.as_ref()).context("decode genesis")?;
+          (g.kinds, Some(g.number))
+        }
+        None => match content.get(id.as_bytes())? {
+          Some(r) => {
+            let c = decode_inscription_content(r.as_ref())?;
+            (kinds_of(&c.content_type, Some(&c.body)), None)
+          }
+          None => (0, None),
+        },
+      });
+    }
+  }
+  Ok(out)
+}
+
+fn wallet_items(by_id: &store::Tree, genesis: &store::Tree, content: &store::Tree, ids: &[String]) -> Result<Vec<WalletInscription>> {
+  let kinds = wallet_kinds_of(genesis, content, ids)?;
+  let mut out = Vec::with_capacity(ids.len());
+  for (id, (k, number)) in ids.iter().zip(kinds) {
     let Some(raw) = by_id.get(id.as_bytes())? else { continue };
     out.push(WalletInscription {
       rec: decode_inscription_record(raw.as_ref())?,
       number,
       kinds: k,
-      drc20: if is_drc20(k) { drc20_op_of(&content, id)? } else { None },
-      tap: if !is_drc20(k) && kind_names(k).iter().any(|n| *n == "json" || *n == "text") { tap_op_of(&content, id)? } else { None },
+      drc20: if wallet_is_drc20(k) { drc20_op_of(content, id)? } else { None },
+      tap: if !wallet_is_drc20(k) && kind_names(k).iter().any(|n| *n == "json" || *n == "text") { tap_op_of(content, id)? } else { None },
     });
   }
-  Ok((total, out))
+  Ok(out)
 }
 
 pub fn list_inscriptions_for_address(
