@@ -302,7 +302,7 @@ pub enum TxtPatch {
 }
 
 impl RecordPatch {
-  fn is_empty(&self) -> bool {
+  pub fn is_empty(&self) -> bool {
     *self == RecordPatch::default()
   }
 }
@@ -343,12 +343,12 @@ impl DnsRecords {
 }
 
 /// Every key that names a record field, aliases included.
-const RECORD_KEYS: &[&str] = &[
+pub(crate) const RECORD_KEYS: &[&str] = &[
   "address", "rev", "addresses", "url", "website", "site", "relay", "insc", "html", "avatar", "content", "cname", "nostr",
   "lightning", "lud16", "txt", "subdomains", "merkle",
 ];
 
-type Obj = serde_json::Map<String, Value>;
+pub(crate) type Obj = serde_json::Map<String, Value>;
 
 /// The value of the first of `keys` present, taken from `top` when any of
 /// them is there (a top-level key wins) and from `nested` otherwise.
@@ -368,6 +368,11 @@ fn scalar(v: Option<&Value>, check: impl Fn(&str) -> Option<String>) -> Option<S
 }
 
 fn parse_patch(top: &Obj, nested: Option<&Obj>) -> RecordPatch {
+  parse_patch_with(top, nested, &|s| normalize_name(s).ok().map(|n| n.name))
+}
+
+/// The same, with `cname` checked by `cname_check` (@ handles point at handles, not names).
+pub(crate) fn parse_patch_with(top: &Obj, nested: Option<&Obj>, cname_check: &dyn Fn(&str) -> Option<String>) -> RecordPatch {
   RecordPatch {
     address: scalar(pick(top, nested, &["address", "rev"]), |s| is_doge_address(s).then(|| s.to_string())),
     url: scalar(pick(top, nested, &["url", "website"]), |s| check_url(s, 512)),
@@ -379,7 +384,7 @@ fn parse_patch(top: &Obj, nested: Option<&Obj>) -> RecordPatch {
       check_inscription_id(s).or_else(|| check_url(s, 128).filter(|u| u.starts_with("https://")))
     }),
     content: scalar(pick(top, nested, &["content"]), |s| (s.chars().count() <= 280).then(|| s.to_string())),
-    cname: scalar(pick(top, nested, &["cname"]), |s| normalize_name(s).ok().map(|n| n.name)),
+    cname: scalar(pick(top, nested, &["cname"]), cname_check),
     nostr: scalar(pick(top, nested, &["nostr"]), check_nostr),
     lightning: scalar(pick(top, nested, &["lightning", "lud16"]), check_lightning),
     subdomains: scalar(pick(top, nested, &["subdomains", "merkle"]), check_hex32),
@@ -538,7 +543,7 @@ pub fn parse_dns_op(content_type: &str, body: &[u8]) -> Option<DnsOp> {
 
 /// A JSON object, also when it has a trailing comma before a `}`, which the
 /// spec accepts.
-fn parse_json_object(text: &str) -> Option<Obj> {
+pub(crate) fn parse_json_object(text: &str) -> Option<Obj> {
   let t = text.trim_start();
   if !t.starts_with('{') {
     return None;
@@ -770,7 +775,7 @@ fn get_name(tree: &Tree, name: &str) -> Result<Option<NameEntry>> {
   tree.get(name.as_bytes())?.map(|v| bincode::deserialize(v.as_ref()).context("decode dns name")).transpose()
 }
 
-fn get_record(by_id: &Tree, id: &str) -> Result<Option<InscriptionRecord>> {
+pub(crate) fn get_record(by_id: &Tree, id: &str) -> Result<Option<InscriptionRecord>> {
   by_id.get(id.as_bytes())?.map(|v| decode_inscription_record(v.as_ref())).transpose()
 }
 
@@ -834,7 +839,7 @@ fn spends_envelope(script_sig_hex: Option<&str>) -> bool {
 const MAX_TRACE_STEPS: usize = 5_000;
 
 /// Follows inscriptions back in time through the node's transactions.
-struct Tracer<'a> {
+pub(crate) struct Tracer<'a> {
   config: &'a Config,
   txs: HashMap<String, TxInfo>,
   blocks: HashMap<String, (u64, Vec<String>)>,
@@ -849,7 +854,7 @@ enum Back {
 }
 
 impl<'a> Tracer<'a> {
-  fn new(config: &'a Config) -> Self {
+  pub(crate) fn new(config: &'a Config) -> Self {
     Tracer { config, txs: HashMap::new(), blocks: HashMap::new() }
   }
 
@@ -932,7 +937,7 @@ impl<'a> Tracer<'a> {
 
   /// Every holder of the inscription from right after `t` until now, newest
   /// first. `None` when it did not exist yet right after `t`.
-  async fn holders_since(&mut self, rec: &InscriptionRecord, t: Pos) -> Result<Option<Vec<String>>> {
+  pub(crate) async fn holders_since(&mut self, rec: &InscriptionRecord, t: Pos) -> Result<Option<Vec<String>>> {
     let id_txid = rec.id.split('i').next().unwrap_or("").to_string();
     let mut loc = Loc::of(rec);
     let mut holders = Vec::new();
@@ -965,12 +970,12 @@ impl<'a> Tracer<'a> {
 
 /// Never moved since it was made in one transaction: then where it is now is
 /// where it was made, and nothing needs looking up.
-fn unmoved(rec: &InscriptionRecord) -> bool {
+pub(crate) fn unmoved(rec: &InscriptionRecord) -> bool {
   rec.vout != u32::MAX && rec.id.strip_suffix("i0") == Some(rec.txid.as_str())
 }
 
 /// Holder of `rec` right after position `t`, or `None` if it did not exist.
-async fn holder_after(tracer: &mut Tracer<'_>, rec: &InscriptionRecord, t: Pos) -> Result<Option<String>> {
+pub(crate) async fn holder_after(tracer: &mut Tracer<'_>, rec: &InscriptionRecord, t: Pos) -> Result<Option<String>> {
   if unmoved(rec) {
     return Ok(Some(rec.address.clone()));
   }
@@ -979,7 +984,7 @@ async fn holder_after(tracer: &mut Tracer<'_>, rec: &InscriptionRecord, t: Pos) 
 
 /// Where and to whom an inscription was made. `seq_pos` is its row in chain
 /// order, which is exact for one made in a single transaction.
-async fn made_by(tracer: &mut Tracer<'_>, rec: &InscriptionRecord, seq_pos: Pos) -> Result<(Pos, String)> {
+pub(crate) async fn made_by(tracer: &mut Tracer<'_>, rec: &InscriptionRecord, seq_pos: Pos) -> Result<(Pos, String)> {
   if unmoved(rec) {
     return Ok((seq_pos, rec.address.clone()));
   }

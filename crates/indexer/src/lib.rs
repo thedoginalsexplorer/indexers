@@ -2,6 +2,7 @@ mod store;
 mod insc_index;
 mod dns;
 mod handles;
+mod ext_pict;
 mod tap;
 mod repair;
 mod renumber;
@@ -18,8 +19,8 @@ pub use dns::{
 };
 
 pub use handles::{
-  HANDLE_MAX_LEN, HandleClaim, HandleListed, HandlePage, HandleRole, HandlesStatus, handle_claims, handle_role, handles_get_many, handles_list, handles_of,
-  handles_status, normalize_handle, run_handles_index,
+  AtOp, HANDLE_MAX_LEN, HandleConfigView, HandleListed, HandlePage, HandleRole, HandleView, HandlesStatus, handle_claims, handle_get, handle_primary,
+  EMOJI_BUCKET, EXTENDED_BUCKET, handle_in_spec, handle_is_emoji, handle_role, handles_get_many, handles_list, handles_of, handles_status, normalize_handle, parse_at_op, run_handles_index,
 };
 
 pub use repair::{inscription_repair_done, run_inscription_repair};
