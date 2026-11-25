@@ -1,6 +1,7 @@
 mod store;
 mod insc_index;
 mod dns;
+mod handles;
 mod tap;
 mod repair;
 mod renumber;
@@ -14,6 +15,11 @@ pub use dns::{
   ClaimEntry, DnsConfigView, DnsListed, DnsName, DnsNameView, DnsPage, DnsRecords, DnsRole, DnsStatus, DnsSupply, dns_claims,
   FEATURED_NAMESPACES, dns_featured, dns_get, dns_list, dns_names_of, dns_namespaces, dns_primary, dns_role, dns_status, dns_supply, normalize_name,
   run_dns_index,
+};
+
+pub use handles::{
+  HANDLE_MAX_LEN, HandleClaim, HandleListed, HandlePage, HandleRole, HandlesStatus, handle_claims, handle_role, handles_get_many, handles_list, handles_of,
+  handles_status, normalize_handle, run_handles_index,
 };
 
 pub use repair::{inscription_repair_done, run_inscription_repair};
@@ -1234,6 +1240,8 @@ fn rollback_one_height(
   insc_index::unnumber_from(db, height)?;
   // And DNS steps that read it.
   dns::undo_from(db, height)?;
+  // And handle steps that read it.
+  handles::undo_from(db, height)?;
 
   blocks.remove(key)?;
   undo_by_height.remove(key)?;

@@ -128,6 +128,12 @@ const KNOWN_TREES: &[&str] = &[
   // last inscription_seq key of a DNS step -> the values it overwrote, for
   // undoing it on a reorg (recent steps only)
   "dns_undo",
+  "handle_name",
+  "handle_by_inscription",
+  "handle_index",
+  "handle_claims",
+  "handle_stats",
+  "handle_undo",
   // DRC-20 state rebuilt by the one-off replay (drc20_replay.rs), swapped in
   // for the live trees when it reaches the tip
   "drc20r_token_info",

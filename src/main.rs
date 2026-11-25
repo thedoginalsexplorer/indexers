@@ -152,6 +152,17 @@ async fn run() -> Result<()> {
     }
   });
 
+  // @handles follow inscription numbering too, the same way.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    loop {
+      if let Err(e) = dogeord_indexer::run_handles_index(c.clone()).await {
+        error!("handles index failed, retrying in a minute: {e:#}");
+      }
+      tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+  });
+
   // D:// (DogeFeed's protocol): posts, comments, quotes and their payments,
   // checked against the registrar, following the main index.
   let c = cfg.clone();

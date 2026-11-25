@@ -376,6 +376,7 @@ async fn run_fix(config: Config, name: &'static str, key: &'static [u8]) -> Resu
     }
     ii::reset_numbering(&db)?;
     dns::reset(&db)?;
+    crate::handles::reset(&db)?;
     let meta = db.open_tree("meta")?;
     meta.insert(key, encode_u64(1).to_vec())?;
     db.flush()?;
@@ -419,6 +420,7 @@ async fn run_first(config: Config) -> Result<()> {
     info!("renumber: dogemaps rebuilt from the corrected chain order: {claims} claimed ({:.0?})", started.elapsed());
     ii::reset_numbering(&db)?;
     dns::reset(&db)?;
+    crate::handles::reset(&db)?;
     let meta = db.open_tree("meta")?;
     meta.insert(DONE_KEY, encode_u64(1).to_vec())?;
     db.flush()?;
