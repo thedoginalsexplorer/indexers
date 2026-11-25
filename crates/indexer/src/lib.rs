@@ -3,6 +3,7 @@ mod insc_index;
 mod dns;
 mod handles;
 mod ext_pict;
+pub mod priority;
 mod tap;
 mod repair;
 mod renumber;
@@ -14,7 +15,7 @@ pub mod bootstrap;
 
 pub use dns::{
   ClaimEntry, DnsConfigView, DnsListed, DnsName, DnsNameView, DnsPage, DnsRecords, DnsRole, DnsStatus, DnsSupply, dns_claims,
-  FEATURED_NAMESPACES, dns_featured, dns_get, dns_list, dns_names_of, dns_namespaces, dns_primary, dns_role, dns_status, dns_supply, normalize_name,
+  FEATURED_NAMESPACES, dns_featured, dns_get, dns_list, dns_view, dns_names_of, dns_namespaces, dns_primary, dns_role, dns_status, dns_supply, normalize_name,
   run_dns_index,
 };
 

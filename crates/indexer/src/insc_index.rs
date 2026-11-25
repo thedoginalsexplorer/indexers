@@ -465,6 +465,22 @@ fn number_some(db: &store::Db, through: u64, max: usize) -> Result<usize> {
   Ok(consumed)
 }
 
+/// Whether `inscription_seq` has a row after `after` (exclusive) and at or before `through`.
+/// The per-protocol indexes use it to tell "nothing left to read" (a run of blocks with no
+/// inscriptions leaves their cursors behind the tip) from "still behind".
+pub(crate) fn seq_rows_between(db: &store::Db, after: &[u8], through: &[u8]) -> Result<bool> {
+  let mut start = after.to_vec();
+  if !start.is_empty() {
+    start.push(0);
+  }
+  let mut found = false;
+  db.open_tree("inscription_seq")?.for_each_from(&start, |k, _| {
+    found = k <= through;
+    Ok(false)
+  })?;
+  Ok(found)
+}
+
 /// Takes back every number given in blocks at `height` and above, newest
 /// first, and moves the cursor back so those heights are numbered again once
 /// the replacing blocks are indexed. Numbers run in chain order, so these are

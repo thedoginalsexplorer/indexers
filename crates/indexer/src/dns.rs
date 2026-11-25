@@ -73,7 +73,9 @@ use unicode_properties::emoji::UnicodeEmoji;
 use unicode_properties::general_category::{GeneralCategoryGroup, UnicodeGeneralCategory};
 use unicode_script::{Script, UnicodeScript};
 
-const DNS_STATE_KEY: &[u8] = b"dns_index_v1";
+/// v2: DNS v1.3 — commit-first priority and bitwork (§5.7). A v1 index is read again from the start.
+const DNS_STATE_KEY: &[u8] = b"dns_index_v2";
+const DNS_EARLIER_KEYS: [&[u8]; 1] = [b"dns_index_v1"];
 
 // ------------------------------------------------------------------ names --
 
@@ -519,7 +521,8 @@ pub fn is_doge_address(s: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsOp {
-  Register { name: DnsName, records: RecordPatch },
+  /// `bitwork`: what a JSON register claims about its txids (§5.7); a claim not met voids it.
+  Register { name: DnsName, records: RecordPatch, bitwork: crate::priority::Bitwork },
   Config { name: DnsName, patch: RecordPatch },
   /// `None` clears the address's choice.
   Primary { name: Option<DnsName> },
@@ -538,7 +541,7 @@ pub fn parse_dns_op(content_type: &str, body: &[u8]) -> Option<DnsOp> {
   // Plain text: the first whitespace-separated token, the rest ignored.
   let token = text.split(char::is_whitespace).find(|t| !t.is_empty())?;
   let name = normalize_name(token).ok()?;
-  Some(DnsOp::Register { name, records: RecordPatch::default() })
+  Some(DnsOp::Register { name, records: RecordPatch::default(), bitwork: crate::priority::Bitwork::default() })
 }
 
 /// A JSON object, also when it has a trailing comma before a `}`, which the
@@ -589,7 +592,7 @@ fn parse_json_op(obj: &Obj) -> Option<DnsOp> {
   let nested = obj.get("config").and_then(Value::as_object);
   match obj.get("op") {
     Some(Value::String(op)) => match op.as_str() {
-      "register" | "reg" => Some(DnsOp::Register { name: name()?, records: parse_patch(obj, None) }),
+      "register" | "reg" => Some(DnsOp::Register { name: name()?, records: parse_patch(obj, None), bitwork: crate::priority::Bitwork::of(obj) }),
       "config" | "update" | "upd" => Some(DnsOp::Config { name: name()?, patch: parse_patch(obj, nested) }),
       "primary" => match name_str? {
         "" => Some(DnsOp::Primary { name: None }),
@@ -638,6 +641,8 @@ pub struct NameEntry {
   /// its last; this is filled in when another register of the name needs
   /// comparing against it.
   pub made_at: Option<Pos>,
+  /// Its commit-first priority key (§5.7), once looked up.
+  pub key: Option<crate::priority::Key>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -782,11 +787,11 @@ pub(crate) fn get_record(by_id: &Tree, id: &str) -> Result<Option<InscriptionRec
 // ----------------------------------------------------------------- tracer --
 
 #[derive(Debug, Clone)]
-struct TxInfo {
-  blockhash: Option<String>,
-  vin: Vec<(Option<String>, Option<u32>, Option<String>)>,
+pub(crate) struct TxInfo {
+  pub(crate) blockhash: Option<String>,
+  pub(crate) vin: Vec<(Option<String>, Option<u32>, Option<String>)>,
   /// value in koinu, address ("" when the script has none)
-  vout: Vec<(u64, String)>,
+  pub(crate) vout: Vec<(u64, String)>,
 }
 
 /// Where an inscription sat, followed back through the node.
@@ -858,7 +863,7 @@ impl<'a> Tracer<'a> {
     Tracer { config, txs: HashMap::new(), blocks: HashMap::new() }
   }
 
-  async fn tx(&mut self, txid: &str) -> Result<TxInfo> {
+  pub(crate) async fn tx(&mut self, txid: &str) -> Result<TxInfo> {
     if let Some(t) = self.txs.get(txid) {
       return Ok(t.clone());
     }
@@ -882,7 +887,7 @@ impl<'a> Tracer<'a> {
   }
 
   /// Height and place in block of a confirmed transaction.
-  async fn position(&mut self, txid: &str) -> Result<Pos> {
+  pub(crate) async fn position(&mut self, txid: &str) -> Result<Pos> {
     let tx = self.tx(txid).await?;
     let Some(hash) = tx.blockhash else { bail!("transaction {txid} is not in a block") };
     if !self.blocks.contains_key(&hash) {
@@ -1111,7 +1116,11 @@ async fn apply(
       }
     };
     let r = match &c.op {
-      DnsOp::Register { name, records } => match lookup(&names, &name.name)? {
+      DnsOp::Register { name, .. } if !bitwork_holds(&mut tracer, &c, lenient).await? => {
+        // §5.7: a bitwork claim the txid does not meet voids the register: not even a missed claim
+        role("void", &name.name, false, "its bitwork claim is not met by its txid")
+      }
+      DnsOp::Register { name, records, .. } => match lookup(&names, &name.name)? {
         Some(mut existing) => {
           // Rows come in chain order of first pieces, so this register is
           // later unless the name's register was made in several pieces and
@@ -1146,9 +1155,21 @@ async fn apply(
             }
             Err(e) => return Err(e),
           };
+          // commit-first (§5.7): the newcomer takes the name only with a lower key while the
+          // holder's row is still pending; the node is asked only inside that window
+          let mut holder_key = existing.key;
+          let won = match crate::priority::contest(&mut tracer, &existing.inscription_id, winner_made, &mut holder_key, &c.id, newcomer_made).await {
+            Ok(k) => k,
+            Err(e) if lenient => {
+              warn!("dns index: could not rank {} against the register of {}: {e:#}", c.id, name.name);
+              (newcomer_made < winner_made).then(|| crate::priority::reveal_key(newcomer_made))
+            }
+            Err(e) => return Err(e),
+          };
+          existing.key = holder_key;
           existing.lost += 1;
           st.claims += 1;
-          if newcomer_made < winner_made {
+          if let Some(new_key) = won {
             // This one was made first: it takes the name, and the one that
             // held it becomes the missed claim.
             batch.insert(&t.claims, name_key(&name.name, existing.number), bincode::serialize(&ClaimEntry {
@@ -1169,6 +1190,7 @@ async fn apply(
             existing.time = c.time;
             existing.records = records.clone();
             existing.made_at = Some(newcomer_made);
+            existing.key = Some(new_key);
             batch.insert(&t.name, name.name.as_bytes().to_vec(), bincode::serialize(&existing)?);
             names.insert(name.name.clone(), existing);
             role("register", &name.name, true, "")
@@ -1202,6 +1224,7 @@ async fn apply(
             index: st.names,
             ns_index,
             made_at: None,
+            key: None,
           };
           batch.insert(&t.name, name.name.as_bytes().to_vec(), bincode::serialize(&entry)?);
           batch.insert(&t.index, st.names.to_be_bytes().to_vec(), name.name.as_bytes().to_vec());
@@ -1359,6 +1382,20 @@ pub(crate) fn reset(db: &store::Db) -> Result<()> {
 /// The error a step returns when a reorg came between reading and writing it.
 const REORGED: &str = "a reorg changed the chain under this stretch";
 
+/// A register's bitwork claims hold (true for one that makes none). When the node can't say and
+/// the stretch is being read leniently, the claim is taken as not met.
+async fn bitwork_holds(tracer: &mut Tracer<'_>, c: &Candidate, lenient: bool) -> Result<bool> {
+  let DnsOp::Register { bitwork, .. } = &c.op else { return Ok(true) };
+  match crate::priority::bitwork_ok(tracer, &c.id, bitwork).await {
+    Ok(ok) => Ok(ok),
+    Err(e) if lenient => {
+      warn!("dns index: could not check the bitwork of {}: {e:#}", c.id);
+      Ok(false)
+    }
+    Err(e) => Err(e),
+  }
+}
+
 /// Undoes every DNS step that read blocks at `height` and above, newest
 /// first, each as one batch. Called by a reorg's rollback.
 pub(crate) fn undo_from(db: &store::Db, height: u64) -> Result<()> {
@@ -1397,6 +1434,20 @@ pub(crate) fn undo_from(db: &store::Db, height: u64) -> Result<()> {
 /// numbering as it goes.
 pub async fn run_dns_index(config: Config) -> Result<()> {
   let db = ii::db_of(&config)?;
+  {
+    let meta = db.open_tree("meta")?;
+    let mut earlier = false;
+    for k in DNS_EARLIER_KEYS {
+      earlier |= meta.get(k)?.is_some();
+    }
+    if earlier {
+      reset(&db)?;
+      for k in DNS_EARLIER_KEYS {
+        meta.remove(k)?;
+      }
+      info!("dns index: rules changed (spec v1.3 commit-first priority and bitwork): reading every name again");
+    }
+  }
   let t = Arc::new(Trees::open(&db)?);
   let mut st = dns_state(&t.meta)?;
   info!("dns index: starting at block {}, {} names so far", st.cursor_height, st.names);
@@ -1470,7 +1521,7 @@ pub fn dns_status(config: &Config) -> Result<DnsStatus> {
   // Read up to what it may read (numbered and settled), and within a few
   // blocks of the settled tip.
   let settled = ii::seq_key((indexed + 1).saturating_sub(DNS_CONFIRMATIONS), u32::MAX).to_vec();
-  let readable = if numbered > settled { settled } else { numbered.clone() };
+  let readable = if numbered > settled { settled.clone() } else { numbered.clone() };
   let mut start = st.cursor.clone();
   if !start.is_empty() {
     start.push(0);
@@ -1480,10 +1531,16 @@ pub fn dns_status(config: &Config) -> Result<DnsStatus> {
     unread = k <= readable.as_slice();
     Ok(false)
   })?;
-  let caught_up = backfilled && !numbered.is_empty() && !unread && st.cursor_height + DNS_CONFIRMATIONS + 3 >= indexed;
+  // Caught up = nothing settled is left to read here, and numbering has every settled row too.
+  // (Not "the last inscription read is near the tip": blocks with no inscriptions in them are
+  // nothing to wait for.)
+  let numbering_behind = numbered < settled && ii::seq_rows_between(&db, &numbered, &settled)?;
+  let caught_up = backfilled && !numbered.is_empty() && !unread && !numbering_behind;
+  // the height read through: the settled tip once caught up, even if its last blocks were empty
+  let read_through = if caught_up { st.cursor_height.max((indexed + 1).saturating_sub(DNS_CONFIRMATIONS)) } else { st.cursor_height };
   Ok(DnsStatus {
     caught_up,
-    height: st.cursor_height,
+    height: read_through,
     scanned: st.scanned,
     names: st.names,
     claims: st.claims,
@@ -1622,8 +1679,12 @@ pub struct DnsConfigView {
   pub height: u64,
   pub time: u64,
   pub owner: String,
-  /// Made by the current holder, so it is part of the records now.
+  /// Made by the current holder, and they have held it ever since, so part of the records now.
   pub applies: bool,
+  #[serde(skip)]
+  pos: Pos,
+  #[serde(skip)]
+  patch: RecordPatch,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1640,28 +1701,110 @@ pub struct DnsNameView {
   pub records: DnsRecords,
   pub configs: Vec<DnsConfigView>,
   pub claims: u64,
+  /// Where wallets send for the name (§8): the `address` record, else the owner; `None` when no
+  /// address can spend the register output (burned).
+  pub pay_to: Option<String>,
+  /// Commit-first priority (§5.7): the key, whether it came from the commit, `pending` or `final`.
+  pub key: crate::priority::Key,
+  pub from_commit: bool,
+  pub status: &'static str,
+  pub final_after: u64,
+  #[serde(skip)]
+  stored_key: Option<crate::priority::Key>,
+  #[serde(skip)]
+  reg_pos: Pos,
+  #[serde(skip)]
+  reg_patch: RecordPatch,
+}
+
+/// A Dogecoin address an output can be paid to; burned outputs are stored without one.
+fn spendable_address(a: &str) -> bool {
+  (33..=35).contains(&a.len()) && matches!(a.as_bytes()[0], b'D' | b'A' | b'9') && a.chars().all(|c| c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l'))
+}
+
+impl DnsNameView {
+  /// Records and pay-to from what counts: the register's own records and each config by the owner,
+  /// when `held(pos)` says the owner has held the name without a break since `pos` (v1.3 §5.3).
+  fn settle(&mut self, mut held: impl FnMut(Pos) -> bool) {
+    let burned = !spendable_address(&self.owner);
+    let mut r = DnsRecords::default();
+    if !burned && held(self.reg_pos) {
+      r.apply(&self.reg_patch);
+    }
+    for c in &mut self.configs {
+      c.applies = !burned && c.owner == self.owner && held(c.pos);
+      if c.applies {
+        r.apply(&c.patch);
+      }
+    }
+    self.pay_to = if burned { None } else { Some(r.address.clone().unwrap_or_else(|| self.owner.clone())) };
+    self.records = if burned { DnsRecords::default() } else { r };
+  }
+  fn set_priority(&mut self, key: crate::priority::Key, from_commit: bool, tip: u64) {
+    self.key = key;
+    self.from_commit = from_commit;
+    self.status = crate::priority::status(key, tip);
+    self.final_after = key.0 + crate::priority::W;
+  }
+}
+
+/// [`dns_get`], with records reset by every change of holder (v1.3 §5.3) — a sale, a gift or a move
+/// to another address empties them, so a buyer never pays into the seller's `address` record — and
+/// the priority key looked up while the row could still be pending.
+pub async fn dns_view(config: &Config, name: &str) -> Result<Option<DnsNameView>> {
+  static HELD: Mutex<Option<HashMap<(String, String, Pos), bool>>> = Mutex::new(None);
+  let (c2, n2) = (config.clone(), name.to_string());
+  let Some(mut v) = tokio::task::spawn_blocking(move || dns_get(&c2, &n2)).await.context("name lookup")?? else { return Ok(None) };
+  let db = ii::db_of(config)?;
+  let tip = ii::meta_u64(&db.open_tree("meta")?, b"indexed_height")?.unwrap_or(0);
+  let (k, from_commit) = crate::priority::key_for_view(config, &v.inscription_id, v.reg_pos, v.stored_key, tip).await;
+  v.set_priority(k, from_commit, tip);
+  let Some(reg) = get_record(&db.open_tree("inscriptions_by_id")?, &v.inscription_id)? else { return Ok(Some(v)) };
+  if unmoved(&reg) || !spendable_address(&v.owner) {
+    return Ok(Some(v));
+  }
+  let mut asks: Vec<Pos> = vec![v.reg_pos];
+  asks.extend(v.configs.iter().filter(|c| c.owner == v.owner).map(|c| c.pos));
+  let at = format!("{}:{}", reg.txid, reg.vout);
+  let mut answers: HashMap<Pos, bool> = HashMap::new();
+  let mut tracer = Tracer::new(config);
+  for p in asks {
+    let key = (v.inscription_id.clone(), at.clone(), p);
+    if let Some(ok) = HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).copied()) {
+      answers.insert(p, ok);
+      continue;
+    }
+    let ok = match tracer.holders_since(&reg, p).await {
+      Ok(Some(holders)) => holders.iter().all(|h| *h == v.owner),
+      _ => false,
+    };
+    answers.insert(p, ok);
+    let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 20_000 {
+      m.clear();
+    }
+    m.insert(key, ok);
+  }
+  v.settle(|p| answers.get(&p).copied().unwrap_or(false));
+  Ok(Some(v))
 }
 
 pub fn dns_get(config: &Config, name: &str) -> Result<Option<DnsNameView>> {
   let db = ii::db_of(config)?;
   let Some(e) = get_name(&db.open_tree("dns_name")?, name)? else { return Ok(None) };
   let owner = get_record(&db.open_tree("inscriptions_by_id")?, &e.inscription_id)?.map(|r| r.address).unwrap_or_default();
-  // The register's records, then each config the current holder made.
-  let mut records = DnsRecords::default();
-  records.apply(&e.records);
   let mut configs = Vec::new();
   let mut start = name.as_bytes().to_vec();
   start.push(0);
   db.open_tree("dns_config")?.for_each_prefix(&start, |_, v| {
     let c: ConfigEntry = bincode::deserialize(v).context("decode dns config")?;
     let applies = !owner.is_empty() && c.owner == owner;
-    if applies {
-      records.apply(&c.patch);
-    }
-    configs.push(DnsConfigView { inscription_id: c.inscription_id, number: c.number, height: c.height, time: c.time, owner: c.owner, applies });
+    configs.push(DnsConfigView { inscription_id: c.inscription_id, number: c.number, height: c.height, time: c.time, owner: c.owner, applies, pos: (c.height, c.tx_index), patch: c.patch });
     Ok(true)
   })?;
-  Ok(Some(DnsNameView {
+  let reg_pos = e.made_at.unwrap_or((e.height, e.tx_index));
+  let mut v = DnsNameView {
     name: e.name,
     label: e.label,
     namespace: e.namespace,
@@ -1671,10 +1814,24 @@ pub fn dns_get(config: &Config, name: &str) -> Result<Option<DnsNameView>> {
     height: e.height,
     time: e.time,
     owner,
-    records,
+    records: DnsRecords::default(),
     configs,
     claims: e.lost,
-  }))
+    pay_to: None,
+    key: crate::priority::reveal_key(reg_pos),
+    from_commit: false,
+    status: "final",
+    final_after: 0,
+    stored_key: e.key,
+    reg_pos,
+    reg_patch: e.records,
+  };
+  // the cheap view: configs by the owner count, the register's records too (dns_view checks moves)
+  v.settle(|_| true);
+  let tip = ii::meta_u64(&db.open_tree("meta")?, b"indexed_height")?.unwrap_or(0);
+  let k = e.key.unwrap_or(v.key);
+  v.set_priority(k, e.key.is_some_and(|k| k != crate::priority::reveal_key(reg_pos)), tip);
+  Ok(Some(v))
 }
 
 /// Later registers of a name, oldest first.
@@ -1802,7 +1959,7 @@ mod tests {
 
     let json = |b: &str| parse_dns_op("application/json", b.as_bytes());
     match json(r#"{"p":"dns","op":"register","name":"jon.doge","url":"https://dogecoin.dog"}"#) {
-      Some(DnsOp::Register { name, records }) => {
+      Some(DnsOp::Register { name, records, .. }) => {
         assert_eq!(name.name, "jon.doge");
         assert_eq!(records.url.as_deref(), Some("https://dogecoin.dog"));
       }
@@ -2078,6 +2235,55 @@ mod tests {
 
   fn txid(n: u8) -> String {
     format!("{n:02x}").repeat(32)
+  }
+
+  /// DNS v1.3 §5.7 sequences (vectors replay-committed-reveal-wins, replay-classic-reveal-ranks-by-reveal,
+  /// slow-committed-reveal-ranks-by-reveal, replay-bitwork-void) through the real scan and apply.
+  #[tokio::test]
+  async fn commit_first_priority_sequences() {
+    let db = store::Db::temporary().unwrap();
+    // ids of their own (0xc1..), so the other tests' reveals stay classic
+    let id = |n: u8| format!("{}i0", txid(n));
+    let (a, b) = ("DBckmbhKFCdFKC5LX8NtMUG5FPZvL5wLHR", "DH5yaieqoZN36fDVciNyRueRGvGLR3mr7L");
+    let bound = |name: &str| crate::priority::tests::committed_sig(&[b"ord".to_vec(), vec![1], b"text/plain".to_vec(), vec![], name.as_bytes().to_vec()], false);
+    {
+      let mut g = crate::priority::TEST_REVEALS.lock().unwrap();
+      let m = g.get_or_insert_with(HashMap::new);
+      // A's committed reveal of carol.doge: commit at (99, 2), vout 0
+      m.insert(txid(0xc2), (bound("carol.doge"), 0, (99, 2)));
+      // A's slow committed reveal of erin.doge: same commit, revealed 32 blocks later
+      m.insert(txid(0xc6), (bound("erin.doge"), 0, (99, 2)));
+      // dave.doge: A's reveal spends the same commit but with the classic redeem (not listed: classic)
+    }
+    let rows = [
+      (100, 5, id(0xc1), b, "text/plain", "carol.doge".to_string()),
+      (100, 6, id(0xc3), b, "text/plain", "dave.doge".to_string()),
+      (100, 7, id(0xc5), b, "text/plain", "erin.doge".to_string()),
+      (100, 8, id(0xc7), a, "application/json", r#"{"p":"dns","op":"reg","name":"fay.doge","bitworkr":"0000000000"}"#.to_string()),
+      (100, 9, id(0xc8), a, "application/json", format!(r#"{{"p":"dns","op":"reg","name":"gil.doge","bitworkr":"{}"}}"#, &txid(0xc8)[..4])),
+      (110, 3, id(0xc2), a, "text/plain", "carol.doge".to_string()),
+      (110, 4, id(0xc4), a, "text/plain", "dave.doge".to_string()),
+      (131, 3, id(0xc6), a, "text/plain", "erin.doge".to_string()),
+    ];
+    let refs: Vec<(u64, u32, &str, &str, &str, &str)> = rows.iter().map(|(h, i, id, ad, ct, b)| (*h, *i, id.as_str(), *ad, *ct, b.as_str())).collect();
+    seed_seq(&db, &refs);
+    let t = Trees::open(&db).unwrap();
+    let config = Config::from_env();
+    let mut st = dns_state(&t.meta).unwrap();
+    while let (c, Some(last), scanned) = scan(&t, &st, 3).unwrap() {
+      st = apply(&config, &t, st, c, last, scanned, false, reorg_gen(&t.meta).unwrap()).await.unwrap();
+    }
+    let holder = |n: &str| get_name(&t.name, n).unwrap().map(|e| (e.inscription_id, e.lost));
+    assert_eq!(holder("carol.doge"), Some((id(0xc2), 1)), "A's commit (99) out-ranks B's reveal (100) inside W");
+    assert_eq!(get_name(&t.name, "carol.doge").unwrap().unwrap().key, Some((99, 2, 0)));
+    assert_eq!(holder("dave.doge"), Some((id(0xc3), 1)), "without the committed redeem a reveal ranks by its reveal");
+    assert_eq!(holder("erin.doge"), Some((id(0xc5), 1)), "131 - 99 > W: A ranks by its reveal");
+    assert_eq!(holder("fay.doge"), None, "a failed bitwork claim is void, not a name");
+    assert_eq!(holder("gil.doge").map(|h| h.0), Some(id(0xc8)), "a bitwork claim the txid meets");
+    let role = |n: u8| -> DnsRole { bincode::deserialize(t.by_inscription.get(id(n).as_bytes()).unwrap().unwrap().as_ref()).unwrap() };
+    assert_eq!(role(0xc1).role, "claim", "B became the missed claim");
+    assert_eq!((role(0xc7).role.as_str(), role(0xc7).counted), ("void", false));
+    assert_eq!(st.claims, 3, "the void register is not a missed claim");
   }
 
   /// First come first served across blocks and within one, configs and

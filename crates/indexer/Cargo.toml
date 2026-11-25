@@ -20,6 +20,7 @@ unicode-script = "0.5"
 unicode-properties = "0.1"
 unicode-normalization = "0.1"
 sha2 = "0.10"
+ripemd = "0.1"
 # bootstrap archives
 tar = "0.4"
 zstd = { version = "0.13", features = ["zstdmt"] }

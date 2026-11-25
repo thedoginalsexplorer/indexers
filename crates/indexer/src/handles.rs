@@ -47,6 +47,7 @@ use crate::store::{Batch, Tree};
 use std::sync::Mutex;
 use unicode_properties::emoji::UnicodeEmoji;
 use crate::ext_pict::is_extended_pictographic;
+use crate::priority::{self, Bitwork, Key};
 
 /// Confirmations a block needs before its handles are read.
 pub const AT_CONFIRMATIONS: u64 = 1;
@@ -56,8 +57,8 @@ const UNDO_BLOCKS: u64 = 100;
 pub const HANDLE_MAX_LEN: usize = 15;
 
 static AT_WRITE: Mutex<()> = Mutex::new(());
-/// v5: spec v1.1 (5c8dcc2: content type ignored, `p` case-insensitive) plus the wider character extension; earlier rows are read again.
-const STATE_KEY: &[u8] = b"at_index_v5";
+/// v6: spec v1.1 (5c8dcc2) with commit-first priority and bitwork (§5.6), plus the wider character extension; earlier rows are read again.
+const STATE_KEY: &[u8] = b"at_index_v6";
 const REORG_GEN_KEY: &[u8] = b"at_reorg_gen";
 const TREES: [&str; 9] = ["at_name", "at_by_inscription", "at_index", "at_len_index", "at_claims", "at_config", "at_primary", "at_stats", "at_undo"];
 /// The first handles index (2026-11-24, before this spec was followed): its
@@ -65,7 +66,7 @@ const TREES: [&str; 9] = ["at_name", "at_by_inscription", "at_index", "at_len_in
 const OLD_TREES: [&str; 6] = ["handle_name", "handle_by_inscription", "handle_index", "handle_claims", "handle_stats", "handle_undo"];
 const OLD_KEYS: [&[u8]; 2] = [b"handles_index_v1", b"handles_reorg_gen"];
 /// Earlier @ index rules: read again from the start under these.
-const EARLIER_KEYS: [&[u8]; 4] = [b"at_index_v1", b"at_index_v2", b"at_index_v3", b"at_index_v4"];
+const EARLIER_KEYS: [&[u8]; 5] = [b"at_index_v1", b"at_index_v2", b"at_index_v3", b"at_index_v4", b"at_index_v5"];
 
 fn reorg_gen(meta: &Tree) -> Result<u64> {
   Ok(ii::meta_u64(meta, REORG_GEN_KEY)?.unwrap_or(0))
@@ -356,7 +357,8 @@ fn bucket_of(handle: &str) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtOp {
-  Register { handle: String, records: RecordPatch },
+  /// `bitwork`: what a JSON register claims about its txids (§5.6); a claim not met voids it.
+  Register { handle: String, records: RecordPatch, bitwork: Bitwork },
   Config { handle: String, patch: RecordPatch },
   /// `None` clears the address's choice.
   Primary { handle: Option<String> },
@@ -387,7 +389,7 @@ pub fn parse_at_op(_content_type: &str, body: &[u8]) -> Option<AtOp> {
   if line.chars().any(char::is_whitespace) {
     return None;
   }
-  Some(AtOp::Register { handle: normalize_handle(line, false)?, records: RecordPatch::default() })
+  Some(AtOp::Register { handle: normalize_handle(line, false)?, records: RecordPatch::default(), bitwork: Bitwork::default() })
 }
 
 fn parse_json_op(obj: &dns::Obj) -> Option<AtOp> {
@@ -400,7 +402,7 @@ fn parse_json_op(obj: &dns::Obj) -> Option<AtOp> {
   let nested = obj.get("config").and_then(Value::as_object);
   match obj.get("op") {
     Some(Value::String(op)) => match op.as_str() {
-      "register" | "reg" => Some(AtOp::Register { handle: handle()?, records: records_of(obj, None) }),
+      "register" | "reg" => Some(AtOp::Register { handle: handle()?, records: records_of(obj, None), bitwork: Bitwork::of(obj) }),
       "config" | "update" | "upd" => Some(AtOp::Config { handle: handle()?, patch: records_of(obj, nested) }),
       "primary" => match name_str? {
         "" => Some(AtOp::Primary { handle: None }),
@@ -441,6 +443,8 @@ pub struct HandleEntry {
   pub len_index: u64,
   /// Where the register was made (its reveal), once known.
   pub made_at: Option<Pos>,
+  /// Its commit-first priority key (§5.6), once looked up.
+  pub key: Option<Key>,
 }
 
 /// What an inscription is to the @ index: register, claim (too late), config
@@ -618,6 +622,20 @@ fn scan(t: &Trees, st: &AtState, max: usize) -> Result<(Vec<Candidate>, Option<V
 
 const REORGED: &str = "a reorg changed the chain under this stretch";
 
+/// A register's bitwork claims hold (true for one that makes none). When the node can't say and
+/// the stretch is being read leniently, the claim is taken as not met.
+async fn bitwork_holds(tracer: &mut Tracer<'_>, c: &Candidate, lenient: bool) -> Result<bool> {
+  let AtOp::Register { bitwork, .. } = &c.op else { return Ok(true) };
+  match priority::bitwork_ok(tracer, &c.id, bitwork).await {
+    Ok(ok) => Ok(ok),
+    Err(e) if lenient => {
+      warn!("at index: could not check the bitwork of {}: {e:#}", c.id);
+      Ok(false)
+    }
+    Err(e) => Err(e),
+  }
+}
+
 /// Applies one stretch in chain order as one batch. `lenient`: after a stretch
 /// failed a few times, what the node cannot settle is recorded as unchecked
 /// instead of stopping the index.
@@ -645,11 +663,15 @@ async fn apply(config: &Config, t: &Trees, mut st: AtState, cands: Vec<Candidate
       }
     };
     let r = match &c.op {
-      AtOp::Register { handle, records } => match lookup(&handles, handle)? {
+      AtOp::Register { handle, .. } if !bitwork_holds(&mut tracer, &c, lenient).await? => {
+        // §5.6: a bitwork claim the txid does not meet voids the register: not even a missed claim
+        role("void", handle, false, "its bitwork claim is not met by its txid")
+      }
+      AtOp::Register { handle, records, .. } => match lookup(&handles, handle)? {
         Some(mut existing) => {
           // Chain order of first pieces puts this one later, unless the
           // handle's register was made in several pieces and finished after
-          // this one was made: rank by where each reveal is (§5.6).
+          // this one was made: where each was made, then the priority key (§5.6).
           let order: Result<(Pos, Pos)> = async {
             let winner_made = match existing.made_at {
               Some(p) => p,
@@ -678,9 +700,21 @@ async fn apply(config: &Config, t: &Trees, mut st: AtState, cands: Vec<Candidate
             }
             Err(e) => return Err(e),
           };
+          // commit-first (§5.6): the newcomer takes the handle only with a lower key while the
+          // holder's row is still pending; the node is asked only inside that window
+          let mut holder_key = existing.key;
+          let won = match priority::contest(&mut tracer, &existing.inscription_id, winner_made, &mut holder_key, &c.id, newcomer_made).await {
+            Ok(k) => k,
+            Err(e) if lenient => {
+              warn!("at index: could not rank {} against the register of {}: {e:#}", c.id, handle);
+              (newcomer_made < winner_made).then(|| priority::reveal_key(newcomer_made))
+            }
+            Err(e) => return Err(e),
+          };
+          existing.key = holder_key;
           existing.lost += 1;
           st.claims += 1;
-          if newcomer_made < winner_made {
+          if let Some(new_key) = won {
             // This one was made first: it takes the handle, the old row is the claim.
             batch.insert(&t.claims, handle_key(handle, existing.number), bincode::serialize(&ClaimEntry {
               inscription_id: existing.inscription_id.clone(),
@@ -700,6 +734,7 @@ async fn apply(config: &Config, t: &Trees, mut st: AtState, cands: Vec<Candidate
             existing.time = c.time;
             existing.records = records.clone();
             existing.made_at = Some(newcomer_made);
+            existing.key = Some(new_key);
             batch.insert(&t.name, handle.as_bytes().to_vec(), bincode::serialize(&existing)?);
             handles.insert(handle.clone(), existing);
             role("register", handle, true, "")
@@ -731,6 +766,7 @@ async fn apply(config: &Config, t: &Trees, mut st: AtState, cands: Vec<Candidate
             index: st.handles,
             len_index,
             made_at: None,
+            key: None,
           };
           batch.insert(&t.name, handle.as_bytes().to_vec(), bincode::serialize(&entry)?);
           batch.insert(&t.index, st.handles.to_be_bytes().to_vec(), handle.as_bytes().to_vec());
@@ -888,7 +924,7 @@ fn drop_old_index(db: &store::Db) -> Result<()> {
       meta.remove(k)?;
     }
     meta.insert(REORG_GEN_KEY, encode_u64(reorg_gen(&meta)? + 1).to_vec())?;
-    info!("at index: rules changed (spec v1.1 + every character type): reading every handle again");
+    info!("at index: rules changed (spec v1.1 commit-first priority + every character type): reading every handle again");
   }
   if meta.get(OLD_KEYS[0])?.is_none() && meta.get(OLD_KEYS[1])?.is_none() {
     return Ok(());
@@ -1014,7 +1050,7 @@ pub fn handles_status(config: &Config) -> Result<HandlesStatus> {
   let backfilled = ii::inscription_seq_backfill_done(config)?;
   let indexed = ii::meta_u64(&meta, b"indexed_height")?.unwrap_or(0);
   let settled = ii::seq_key((indexed + 1).saturating_sub(AT_CONFIRMATIONS), u32::MAX).to_vec();
-  let readable = if numbered > settled { settled } else { numbered.clone() };
+  let readable = if numbered > settled { settled.clone() } else { numbered.clone() };
   let mut start = st.cursor.clone();
   if !start.is_empty() {
     start.push(0);
@@ -1024,14 +1060,20 @@ pub fn handles_status(config: &Config) -> Result<HandlesStatus> {
     unread = k <= readable.as_slice();
     Ok(false)
   })?;
-  let caught_up = backfilled && !numbered.is_empty() && !unread && st.cursor_height + AT_CONFIRMATIONS + 3 >= indexed;
+  // Caught up = nothing settled is left to read here, and numbering has every settled row too.
+  // (Not "the last inscription read is near the tip": blocks with no inscriptions in them are
+  // nothing to wait for.)
+  let numbering_behind = numbered < settled && ii::seq_rows_between(&db, &numbered, &settled)?;
+  let caught_up = backfilled && !numbered.is_empty() && !unread && !numbering_behind;
+  // the height read through: the settled tip once caught up, even if its last blocks were empty
+  let read_through = if caught_up { st.cursor_height.max((indexed + 1).saturating_sub(AT_CONFIRMATIONS)) } else { st.cursor_height };
   let stats = db.open_tree("at_stats")?;
   let by_length = (1..=HANDLE_MAX_LEN).map(|l| Ok((l, get_u64(&stats, &len_count_key(l))?))).collect::<Result<Vec<_>>>()?;
   let emoji = get_u64(&stats, &len_count_key(EMOJI_BUCKET))?;
   let extended = get_u64(&stats, &len_count_key(EXTENDED_BUCKET))?;
   Ok(HandlesStatus {
     caught_up,
-    height: st.cursor_height,
+    height: read_through,
     scanned: st.scanned,
     handles: st.handles,
     claims: st.claims,
@@ -1054,6 +1096,8 @@ pub struct HandleListed {
   pub time: u64,
   pub owner: String,
   pub claims: u64,
+  /// §5.6: `pending` while a lower key could still take it (from the stored key, else its reveal)
+  pub status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1062,7 +1106,9 @@ pub struct HandlePage {
   pub items: Vec<HandleListed>,
 }
 
-fn listed(t_name: &Tree, by_id: &Tree, handles: Vec<Vec<u8>>) -> Result<Vec<HandleListed>> {
+fn listed(db: &store::Db, handles: Vec<Vec<u8>>) -> Result<Vec<HandleListed>> {
+  let (t_name, by_id) = (db.open_tree("at_name")?, db.open_tree("inscriptions_by_id")?);
+  let tip = ii::meta_u64(&db.open_tree("meta")?, b"indexed_height")?.unwrap_or(0);
   let mut out = Vec::new();
   let mut ids = Vec::new();
   for raw in t_name.multi_get(&handles)?.into_iter().flatten() {
@@ -1075,6 +1121,7 @@ fn listed(t_name: &Tree, by_id: &Tree, handles: Vec<Vec<u8>>) -> Result<Vec<Hand
     .into_iter()
     .zip(recs)
     .map(|(e, r)| HandleListed {
+      status: priority::status(e.key.unwrap_or_else(|| priority::reveal_key(e.made_at.unwrap_or((e.height, e.tx_index)))), tip),
       owner: r.and_then(|r| decode_inscription_record(r.as_ref()).ok()).map(|r| r.address).unwrap_or_default(),
       handle: e.handle,
       inscription_id: e.inscription_id,
@@ -1105,13 +1152,13 @@ pub fn handles_list(config: &Config, len: Option<usize>, offset: u64, limit: u64
   };
   let tree = db.open_tree(if len.is_some() { "at_len_index" } else { "at_index" })?;
   let handles: Vec<Vec<u8>> = tree.multi_get(&keys)?.into_iter().flatten().map(|v| v.to_vec()).collect();
-  Ok(HandlePage { total, items: listed(&db.open_tree("at_name")?, &db.open_tree("inscriptions_by_id")?, handles)? })
+  Ok(HandlePage { total, items: listed(&db, handles)? })
 }
 
 /// Several handles at once (canonical, with `@`), those that exist.
 pub fn handles_get_many(config: &Config, handles: &[String]) -> Result<Vec<HandleListed>> {
   let db = ii::db_of(config)?;
-  listed(&db.open_tree("at_name")?, &db.open_tree("inscriptions_by_id")?, handles.iter().map(|h| h.as_bytes().to_vec()).collect())
+  listed(&db, handles.iter().map(|h| h.as_bytes().to_vec()).collect())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1145,6 +1192,14 @@ pub struct HandleView {
   pub pay_to: Option<String>,
   /// Letters that only look like `a-z` (see [`handle_confusable`]).
   pub confusable: bool,
+  /// Commit-first priority (§5.6): the key, whether it came from the commit, and
+  /// `pending` (a lower key could still take it, until `final_after`) or `final`.
+  pub key: Key,
+  pub from_commit: bool,
+  pub status: &'static str,
+  pub final_after: u64,
+  #[serde(skip)]
+  stored_key: Option<Key>,
   #[serde(skip)]
   reg_pos: Pos,
   #[serde(skip)]
@@ -1184,14 +1239,29 @@ pub fn handle_get(config: &Config, handle: &str) -> Result<Option<HandleView>> {
     configs,
     claims: e.lost,
     pay_to: None,
+    key: priority::reveal_key(e.made_at.unwrap_or((e.height, e.tx_index))),
+    from_commit: false,
+    status: "final",
+    final_after: 0,
+    stored_key: e.key,
     reg_pos: e.made_at.unwrap_or((e.height, e.tx_index)),
     reg_patch: e.records,
   };
+  let tip = ii::meta_u64(&db.open_tree("meta")?, b"indexed_height")?.unwrap_or(0);
+  let k = e.key.unwrap_or(v.key);
+  v.set_priority(k, e.key.is_some_and(|k| k != v.key), tip);
   v.settle(|_| true);
   Ok(Some(v))
 }
 
 impl HandleView {
+  fn set_priority(&mut self, key: Key, from_commit: bool, tip: u64) {
+    self.key = key;
+    self.from_commit = from_commit;
+    self.status = priority::status(key, tip);
+    self.final_after = key.0 + priority::W;
+  }
+
   /// Records and pay-to from what counts: the register's own records and each config by the
   /// owner, when `held(pos)` says the owner has held the handle without a break since `pos`.
   fn settle(&mut self, mut held: impl FnMut(Pos) -> bool) {
@@ -1219,6 +1289,10 @@ pub async fn handle_view(config: &Config, handle: &str) -> Result<Option<HandleV
   let (c2, h2) = (config.clone(), handle.to_string());
   let Some(mut v) = tokio::task::spawn_blocking(move || handle_get(&c2, &h2)).await.context("handle lookup")?? else { return Ok(None) };
   let db = ii::db_of(config)?;
+  // while it could still be pending, its key from the node (a committed reveal ranks by its commit)
+  let tip = ii::meta_u64(&db.open_tree("meta")?, b"indexed_height")?.unwrap_or(0);
+  let (k, from_commit) = priority::key_for_view(config, &v.inscription_id, v.reg_pos, v.stored_key, tip).await;
+  v.set_priority(k, from_commit, tip);
   let Some(reg) = dns::get_record(&db.open_tree("inscriptions_by_id")?, &v.inscription_id)? else { return Ok(Some(v)) };
   if dns::unmoved(&reg) || !spendable_address(&v.owner) {
     // never left the address it was made to (or burned: settle() already emptied it)
@@ -1295,7 +1369,7 @@ pub fn handles_of(config: &Config, address: &str) -> Result<Vec<HandleListed>> {
       }
     }
   }
-  let mut out = listed(&db.open_tree("at_name")?, &db.open_tree("inscriptions_by_id")?, handles)?;
+  let mut out = listed(&db, handles)?;
   out.retain(|h| h.owner == address);
   out.sort_by_key(|h| h.number);
   Ok(out)
@@ -1546,7 +1620,7 @@ mod tests {
     let view = |owner: &str| HandleView {
       handle: "@jon".into(), inscription_id: String::new(), number: 0, height: 10, time: 0, owner: owner.into(), records: DnsRecords::default(),
       configs: vec![cfg(&me, (20, 0), "D9kTcGVqHLnBgmKrW9CvB7TrJ6tqC7wHXk"), cfg(&other, (30, 0), "DBXu2kgc3xtvCUWFcxFE3r9hEYgmuaaCyD")],
-      claims: 0, pay_to: None, confusable: false, reg_pos: (10, 0), reg_patch: RecordPatch::default(),
+      claims: 0, pay_to: None, confusable: false, key: (10, 0, 0), from_commit: false, status: "final", final_after: 40, stored_key: None, reg_pos: (10, 0), reg_patch: RecordPatch::default(),
     };
     // held since before its config: the record counts
     let mut v = view(&me);
