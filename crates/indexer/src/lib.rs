@@ -19,7 +19,7 @@ pub use dns::{
 };
 
 pub use handles::{
-  AtOp, HANDLE_MAX_LEN, HandleConfigView, HandleListed, HandlePage, HandleRole, HandleView, HandlesStatus, handle_claims, handle_get, handle_primary,
+  AtOp, HANDLE_MAX_LEN, HandleConfigView, HandleListed, HandlePage, HandleRole, HandleView, HandlesStatus, handle_claims, handle_confusable, handle_get, handle_primary, handle_view,
   EMOJI_BUCKET, EXTENDED_BUCKET, handle_in_spec, handle_is_emoji, handle_role, handles_get_many, handles_list, handles_of, handles_status, normalize_handle, parse_at_op, run_handles_index,
 };
 

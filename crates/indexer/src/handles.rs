@@ -56,8 +56,8 @@ const UNDO_BLOCKS: u64 = 100;
 pub const HANDLE_MAX_LEN: usize = 15;
 
 static AT_WRITE: Mutex<()> = Mutex::new(());
-/// v4: the spec of ba673a0 (emoji and flags as characters) plus the extension; earlier rows are read again.
-const STATE_KEY: &[u8] = b"at_index_v4";
+/// v5: spec v1.1 (5c8dcc2: content type ignored, `p` case-insensitive) plus the wider character extension; earlier rows are read again.
+const STATE_KEY: &[u8] = b"at_index_v5";
 const REORG_GEN_KEY: &[u8] = b"at_reorg_gen";
 const TREES: [&str; 9] = ["at_name", "at_by_inscription", "at_index", "at_len_index", "at_claims", "at_config", "at_primary", "at_stats", "at_undo"];
 /// The first handles index (2026-11-24, before this spec was followed): its
@@ -65,7 +65,7 @@ const TREES: [&str; 9] = ["at_name", "at_by_inscription", "at_index", "at_len_in
 const OLD_TREES: [&str; 6] = ["handle_name", "handle_by_inscription", "handle_index", "handle_claims", "handle_stats", "handle_undo"];
 const OLD_KEYS: [&[u8]; 2] = [b"handles_index_v1", b"handles_reorg_gen"];
 /// Earlier @ index rules: read again from the start under these.
-const EARLIER_KEYS: [&[u8]; 3] = [b"at_index_v1", b"at_index_v2", b"at_index_v3"];
+const EARLIER_KEYS: [&[u8]; 4] = [b"at_index_v1", b"at_index_v2", b"at_index_v3", b"at_index_v4"];
 
 fn reorg_gen(meta: &Tree) -> Result<u64> {
   Ok(ii::meta_u64(meta, REORG_GEN_KEY)?.unwrap_or(0))
@@ -85,6 +85,11 @@ fn fold_fullwidth(s: &str) -> String {
 /// Spec §6: fullwidth fold, ASCII lowercase, one leading `@`, localpart
 /// `[a-z0-9_]{1,15}`. Returns the canonical `@jon`. `missing_at_ok`: the JSON
 /// `name` field (and lookups) may leave the `@` out; plain text may not.
+///
+/// The spec's rules (and the emoji extension) are tried first, exactly as before. Only what
+/// they turn down is read under the wider extension ([`fold_wide`]), and a spelling that the
+/// wider rules would fold into a handle of the spec (a Kelvin sign for `k`, say) is refused:
+/// the extension adds handles, it never claims one the spec defines.
 pub fn normalize_handle(input: &str, missing_at_ok: bool) -> Option<String> {
   let s = fold_fullwidth(input);
   let local = match s.strip_prefix('@') {
@@ -92,8 +97,141 @@ pub fn normalize_handle(input: &str, missing_at_ok: bool) -> Option<String> {
     None if missing_at_ok => s.as_str(),
     None => return None,
   };
-  let (folded, units) = fold_localpart(local)?;
-  (1..=HANDLE_MAX_LEN).contains(&units).then(|| format!("@{folded}"))
+  if let Some((folded, units)) = fold_localpart(local) {
+    return (1..=HANDLE_MAX_LEN).contains(&units).then(|| format!("@{folded}"));
+  }
+  let (folded, units) = fold_wide(local)?;
+  let h = format!("@{folded}");
+  ((1..=HANDLE_MAX_LEN).contains(&units) && !handle_in_spec(&h)).then_some(h)
+}
+
+/// Most combining marks one letter may carry (no stacks of marks).
+const MAX_MARKS: usize = 4;
+
+/// The wider extension (DPAYMARKET, 2026-11-25): every kind of character a name is written
+/// with, not only `a-z 0-9 _` and emoji —
+///  - letters of any script, lowercased (`@Élodie` → `@élodie`, `@жон`, `@太郎`), all from one
+///    script (plus `a-z`, which is Latin): `@bіlly` with a Cyrillic `і` is refused;
+///  - combining marks on a letter (at most [`MAX_MARKS`]), counted with it;
+///  - digits and numbers of any script (`@٣`, `@Ⅻ`), symbols (`@₿illy`, `@€uro`, `@∞`, `@♛`)
+///    and non-ASCII punctuation (`@「jon」`);
+///  - emoji as in [`fold_localpart`].
+/// Never: spaces, invisible or control characters, ASCII other than `a-z 0-9 _`, anything that
+/// reads as `.`, `/` or `@`, or a letter whose lowercase is ASCII. NFC first, so `é` typed as
+/// `e` + accent and as one character are the same handle.
+fn fold_wide(local: &str) -> Option<(String, usize)> {
+  use unicode_normalization::UnicodeNormalization;
+  use unicode_properties::general_category::{GeneralCategory as G, GeneralCategoryGroup as GG, UnicodeGeneralCategory};
+  use unicode_script::{Script, UnicodeScript};
+  let nfc: String = local.nfc().collect();
+  let chars: Vec<char> = nfc.chars().filter(|&c| c != '\u{FE0F}' && c != '\u{FE0E}').collect();
+  if chars.len() > 64 {
+    return None;
+  }
+  let (mut out, mut units) = (String::with_capacity(nfc.len()), 0usize);
+  let mut script: Option<Script> = None;
+  let mut same = |sc: Script| -> bool {
+    match script {
+      Some(s) if s != sc => false,
+      _ => {
+        script = Some(sc);
+        true
+      }
+    }
+  };
+  let (mut open_flag, mut marks) = (false, 0usize);
+  for (i, &c) in chars.iter().enumerate() {
+    let prev = i.checked_sub(1).map(|j| chars[j]);
+    let next = chars.get(i + 1).copied();
+    let flag_half = is_regional(c) && open_flag;
+    open_flag = is_regional(c) && !open_flag;
+    if c.general_category_group() != GG::Mark {
+      marks = 0;
+    }
+    if c.is_ascii() {
+      if !(c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+      }
+      if c.is_ascii_alphabetic() && !same(Script::Latin) {
+        return None;
+      }
+      out.push(c.to_ascii_lowercase());
+      units += 1;
+    } else if c == '\u{200D}' {
+      if !(prev.is_some_and(is_emoji) && next.is_some_and(is_emoji)) {
+        return None;
+      }
+      out.push(c);
+    } else if c == '\u{20E3}' {
+      if !prev.is_some_and(|p| p.is_ascii_digit()) {
+        return None;
+      }
+      out.push(c);
+    } else if is_skin_tone(c) && prev.is_some_and(|p| is_emoji(p) && !is_skin_tone(p)) {
+      out.push(c);
+    } else if is_tag(c) {
+      if !prev.is_some_and(|p| is_emoji(p) || is_tag(p)) {
+        return None;
+      }
+      out.push(c);
+    } else if is_emoji(c) {
+      out.push(c);
+      if !flag_half && prev != Some('\u{200D}') {
+        units += 1;
+      }
+    } else {
+      if c.is_whitespace() || dns::is_default_ignorable(c) || dns::is_dot_or_slash_lookalike(c) || matches!(c, '\u{FE6B}' | '\u{FF20}' | '\u{E0040}') {
+        return None;
+      }
+      match c.general_category_group() {
+        GG::Letter => {
+          let sc = c.script();
+          if !matches!(sc, Script::Common | Script::Inherited | Script::Unknown) && !same(sc) {
+            return None;
+          }
+          let lower: String = c.to_lowercase().collect();
+          if lower.chars().any(|l| l.is_ascii()) {
+            return None;
+          }
+          out.push_str(&lower);
+          units += 1;
+        }
+        GG::Mark => {
+          // only on something drawn before it
+          marks += 1;
+          if prev.is_none() || marks > MAX_MARKS {
+            return None;
+          }
+          out.push(c);
+        }
+        GG::Number | GG::Symbol | GG::Punctuation => {
+          // some have a lowercase too (Ⅻ → ⅻ, Ⓐ → ⓐ)
+          let lower: String = c.to_lowercase().collect();
+          if lower.chars().any(|l| l.is_ascii()) {
+            return None;
+          }
+          out.push_str(&lower);
+          units += 1;
+        }
+        // spaces, controls, format, private use, unassigned
+        _ => return None,
+      }
+      if matches!(c.general_category(), G::PrivateUse | G::Unassigned | G::Surrogate) {
+        return None;
+      }
+    }
+  }
+  if out.is_empty() || units == 0 {
+    return None;
+  }
+  Some((out, units))
+}
+
+/// A handle with letters that look like plain `a-z` but aren't (all-Cyrillic `@аре`, say): kept,
+/// and flagged so wallets and pages can warn before anyone pays it.
+pub fn handle_confusable(handle: &str) -> bool {
+  let l = handle.trim_start_matches('@');
+  l.chars().any(|c| !c.is_ascii() && dns::ascii_lookalike(c)) && l.chars().all(|c| c.is_ascii() || dns::ascii_lookalike(c))
 }
 
 fn is_emoji(c: char) -> bool {
@@ -198,7 +336,8 @@ pub fn handle_in_spec(handle: &str) -> bool {
 
 /// The localpart's length, in symbols, of a canonical handle.
 fn len_of(handle: &str) -> usize {
-  fold_localpart(handle.trim_start_matches('@')).map(|(_, n)| n).unwrap_or(0)
+  let l = handle.trim_start_matches('@');
+  fold_localpart(l).or_else(|| fold_wide(l)).map(|(_, n)| n).unwrap_or(0)
 }
 
 /// Bucket of the per-length index: `a-z 0-9 _` handles by length (1..=15), handles of the spec
@@ -232,9 +371,9 @@ fn records_of(top: &dns::Obj, nested: Option<&dns::Obj>) -> RecordPatch {
 }
 
 /// Reads an @ operation out of an inscription's content, if it is one (§5).
-pub fn parse_at_op(content_type: &str, body: &[u8]) -> Option<AtOp> {
-  let essence = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-  if essence != "text/plain" && essence != "application/json" {
+pub fn parse_at_op(_content_type: &str, body: &[u8]) -> Option<AtOp> {
+  // v1.1 §5: the content type is never consulted; the body bytes decide.
+  if body.len() > 64 * 1024 {
     return None;
   }
   let text = std::str::from_utf8(body).ok()?;
@@ -252,7 +391,8 @@ pub fn parse_at_op(content_type: &str, body: &[u8]) -> Option<AtOp> {
 }
 
 fn parse_json_op(obj: &dns::Obj) -> Option<AtOp> {
-  if obj.get("p").and_then(Value::as_str) != Some("at") {
+  // v1.1: a JSON string equal to `at` under ASCII case folding; `"p":"@"` and the rest are not this protocol.
+  if !obj.get("p").and_then(Value::as_str).is_some_and(|p| p.eq_ignore_ascii_case("at")) {
     return None;
   }
   let name_str = obj.get("name").and_then(Value::as_str);
@@ -441,8 +581,10 @@ fn scan(t: &Trees, st: &AtState, max: usize) -> Result<(Vec<Candidate>, Option<V
     scanned += 1;
     last = Some(k.to_vec());
     let e: ii::SeqEntry = bincode::deserialize(v).context("decode seq entry")?;
-    // text/plain and application/json bodies classify as text or json.
-    if e.kinds & (ii::K_TEXT | ii::K_JSON) != 0 {
+    // v1.1: the content type doesn't matter, only the body. Text, JSON, code, HTML and untyped
+    // bodies are read; images, video, audio, models, PDFs and fonts are not (a body that is
+    // exactly `@jon` under one of those types is not worth reading every picture on the chain).
+    if e.kinds & (ii::K_TEXT | ii::K_JSON | ii::K_OTHER | ii::K_CODE | ii::K_HTML) != 0 {
       rows.push((k.to_vec(), e));
     }
     Ok(true)
@@ -746,7 +888,7 @@ fn drop_old_index(db: &store::Db) -> Result<()> {
       meta.remove(k)?;
     }
     meta.insert(REORG_GEN_KEY, encode_u64(reorg_gen(&meta)? + 1).to_vec())?;
-    info!("at index: rules changed (spec c3cd509 one-emoji handles + extension): reading every handle again");
+    info!("at index: rules changed (spec v1.1 + every character type): reading every handle again");
   }
   if meta.get(OLD_KEYS[0])?.is_none() && meta.get(OLD_KEYS[1])?.is_none() {
     return Ok(());
@@ -979,8 +1121,12 @@ pub struct HandleConfigView {
   pub height: u64,
   pub time: u64,
   pub owner: String,
-  /// Made by the current holder, so part of the records now.
+  /// Made by the current holder, and they have held it ever since, so part of the records now.
   pub applies: bool,
+  #[serde(skip)]
+  pos: Pos,
+  #[serde(skip)]
+  patch: RecordPatch,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -994,39 +1140,117 @@ pub struct HandleView {
   pub records: DnsRecords,
   pub configs: Vec<HandleConfigView>,
   pub claims: u64,
+  /// Where wallets send for `@jon` (spec §8): the `address` record, else the owner; `None` when
+  /// no address can spend the register output (burned).
+  pub pay_to: Option<String>,
+  /// Letters that only look like `a-z` (see [`handle_confusable`]).
+  pub confusable: bool,
+  #[serde(skip)]
+  reg_pos: Pos,
+  #[serde(skip)]
+  reg_patch: RecordPatch,
 }
 
-/// A handle with its records: the register's, then each config its current
-/// holder made (spec §5.3, §7).
+/// A Dogecoin address an output can be paid to (P2PKH `D…`, P2SH `A…`/`9…`); burned outputs
+/// (OP_RETURN, scripts with no address) are stored without one.
+fn spendable_address(a: &str) -> bool {
+  (33..=35).contains(&a.len()) && matches!(a.as_bytes()[0], b'D' | b'A' | b'9') && a.chars().all(|c| c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l'))
+}
+
+/// A handle as stored, with the records its current holder wrote. Records count only while the
+/// address that wrote them still holds the handle (see [`handle_view`], which checks the moves).
 pub fn handle_get(config: &Config, handle: &str) -> Result<Option<HandleView>> {
   let db = ii::db_of(config)?;
   let Some(e) = get_entry(&db.open_tree("at_name")?, handle)? else { return Ok(None) };
   let owner = dns::get_record(&db.open_tree("inscriptions_by_id")?, &e.inscription_id)?.map(|r| r.address).unwrap_or_default();
-  let mut records = DnsRecords::default();
-  records.apply(&e.records);
   let mut configs = Vec::new();
   let mut start = handle.as_bytes().to_vec();
   start.push(0);
   db.open_tree("at_config")?.for_each_prefix(&start, |_, v| {
     let c: ConfigEntry = bincode::deserialize(v).context("decode at config")?;
     let applies = !owner.is_empty() && c.owner == owner;
-    if applies {
-      records.apply(&c.patch);
-    }
-    configs.push(HandleConfigView { inscription_id: c.inscription_id, number: c.number, height: c.height, time: c.time, owner: c.owner, applies });
+    configs.push(HandleConfigView { inscription_id: c.inscription_id, number: c.number, height: c.height, time: c.time, owner: c.owner, applies, pos: (c.height, c.tx_index), patch: c.patch });
     Ok(true)
   })?;
-  Ok(Some(HandleView {
+  let mut v = HandleView {
+    confusable: handle_confusable(&e.handle),
     handle: e.handle,
     inscription_id: e.inscription_id,
     number: e.number,
     height: e.height,
     time: e.time,
     owner,
-    records,
+    records: DnsRecords::default(),
     configs,
     claims: e.lost,
-  }))
+    pay_to: None,
+    reg_pos: e.made_at.unwrap_or((e.height, e.tx_index)),
+    reg_patch: e.records,
+  };
+  v.settle(|_| true);
+  Ok(Some(v))
+}
+
+impl HandleView {
+  /// Records and pay-to from what counts: the register's own records and each config by the
+  /// owner, when `held(pos)` says the owner has held the handle without a break since `pos`.
+  fn settle(&mut self, mut held: impl FnMut(Pos) -> bool) {
+    let burned = !spendable_address(&self.owner);
+    let mut r = DnsRecords::default();
+    if !burned && held(self.reg_pos) {
+      r.apply(&self.reg_patch);
+    }
+    for c in &mut self.configs {
+      c.applies = !burned && c.owner == self.owner && held(c.pos);
+      if c.applies {
+        r.apply(&c.patch);
+      }
+    }
+    self.pay_to = if burned { None } else { Some(r.address.clone().unwrap_or_else(|| self.owner.clone())) };
+    self.records = if burned { DnsRecords::default() } else { r };
+  }
+}
+
+/// [`handle_get`], with records reset by every change of holder (spec v1.1 §5.3): a sale, a gift
+/// or a move to another address of the same wallet empties them, so a buyer never pays into the
+/// seller's `address` record. A move that pays the same address keeps them.
+pub async fn handle_view(config: &Config, handle: &str) -> Result<Option<HandleView>> {
+  static HELD: Mutex<Option<HashMap<(String, String, Pos), bool>>> = Mutex::new(None);
+  let (c2, h2) = (config.clone(), handle.to_string());
+  let Some(mut v) = tokio::task::spawn_blocking(move || handle_get(&c2, &h2)).await.context("handle lookup")?? else { return Ok(None) };
+  let db = ii::db_of(config)?;
+  let Some(reg) = dns::get_record(&db.open_tree("inscriptions_by_id")?, &v.inscription_id)? else { return Ok(Some(v)) };
+  if dns::unmoved(&reg) || !spendable_address(&v.owner) {
+    // never left the address it was made to (or burned: settle() already emptied it)
+    return Ok(Some(v));
+  }
+  // positions worth asking about: the register's, and each config the owner made
+  let mut asks: Vec<Pos> = vec![v.reg_pos];
+  asks.extend(v.configs.iter().filter(|c| c.owner == v.owner).map(|c| c.pos));
+  let at = format!("{}:{}", reg.txid, reg.vout);
+  let mut answers: HashMap<Pos, bool> = HashMap::new();
+  let mut tracer = Tracer::new(config);
+  for p in asks {
+    let key = (v.inscription_id.clone(), at.clone(), p);
+    if let Some(ok) = HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).copied()) {
+      answers.insert(p, ok);
+      continue;
+    }
+    let ok = match tracer.holders_since(&reg, p).await {
+      Ok(Some(holders)) => holders.iter().all(|h| *h == v.owner),
+      // not made yet right after p (can't be for these), or the trace failed: don't trust old records
+      _ => false,
+    };
+    answers.insert(p, ok);
+    let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 20_000 {
+      m.clear();
+    }
+    m.insert(key, ok);
+  }
+  v.settle(|p| answers.get(&p).copied().unwrap_or(false));
+  Ok(Some(v))
 }
 
 /// Later registers of a handle, oldest first.
@@ -1115,7 +1339,7 @@ pub async fn handle_primary(config: &Config, address: &str) -> Result<Option<Str
 mod tests {
   use super::*;
 
-  /// spec `vectors/conformance.json` (version 1), verbatim.
+  /// spec `vectors/conformance.json` (version 1.1, 5c8dcc2), verbatim.
   #[test]
   fn conformance_vectors() {
     let reg = |b: &str| match parse_at_op("text/plain", b.as_bytes()) {
@@ -1136,6 +1360,14 @@ mod tests {
       (r#"{"p":"at","op":"config","name":"@jon","content":"hi"}"#, "config", "@jon"),
       (r#"{"p":"at","op":"upd","name":"jon","url":"https://dogecoin.dog"}"#, "config", "@jon"),
       (r#"{"p":"at","op":"primary","name":"@jon"}"#, "primary", "@jon"),
+      // v1.1
+      (r#"{"p":"AT","op":"reg","name":"jon"}"#, "register", "@jon"),
+      (r#"{"p":"dns","p":"at","op":"reg","name":"jon"}"#, "register", "@jon"),
+      ("@jon
+", "register", "@jon"),
+      ("﻿@jon", "register", "@jon"),
+      (r#"{"p":"at","op":"config","name":"@jon","address":"D8mZsgKwmSQWYRPEMCcm8KzNFj1JVF5UpA"}"#, "config", "@jon"),
+      (r#"{"p":"at","op":"primary","name":""}"#, "primary", ""),
     ];
     for (body, op, handle) in ok {
       assert_eq!(reg(body), Some((*op, handle.to_string())), "{body}");
@@ -1155,10 +1387,21 @@ mod tests {
       r#"{"p":"at","op":"transfer","name":"@jon"}"#,
       r#"{"p":"at","op":"revoke","name":"@jon"}"#,
       r#"{"p":"at","op":"reg","name":"jon.doge"}"#,
+      // v1.1
+      r#"{"p":"@","op":"reg","name":"jon"}"#,
+      r#"{"p":"handle","op":"reg","name":"@jon"}"#,
+      r#"{"p":1,"op":"reg","name":"@jon"}"#,
+      r#"{"p":"at","p":"dns","op":"reg","name":"jon"}"#,
+      "@jon
+
+",
+      " @jon",
     ];
     for body in bad {
       assert_eq!(reg(body), None, "{body}");
     }
+    // v1.1: the content type is never consulted
+    assert!(matches!(parse_at_op("image/png", b"@jon"), Some(AtOp::Register { handle, .. }) if handle == "@jon"), "plain-content-type-ignored");
     // the record values the vectors give
     match parse_at_op("application/json", br#"{"p":"at","op":"config","name":"@jon","content":"hi"}"#) {
       Some(AtOp::Config { patch, .. }) => assert_eq!(patch.content.as_deref(), Some("hi")),
@@ -1201,8 +1444,8 @@ mod tests {
       other => panic!("{other:?}"),
     }
     assert_eq!(parse_at_op("application/json", br#"{"p":"at","op":"primary","name":""}"#), Some(AtOp::Primary { handle: None }));
-    assert_eq!(parse_at_op("image/png", b"@jon"), None);
-    assert_eq!(parse_at_op("text/html", b"@jon"), None);
+    assert!(parse_at_op("text/html", b"@jon").is_some(), "v1.1: the type doesn't matter");
+    assert!(parse_at_op("", b"@jon").is_some(), "nor does a missing one");
     assert_eq!(normalize_handle("jon", true), Some("@jon".into()));
   }
 
@@ -1225,8 +1468,8 @@ mod tests {
     assert_eq!(n(&format!("@{}", "🐕".repeat(16))), None, "16 symbols");
     assert_eq!(n("@\u{200D}🐕"), None, "a joiner not inside a sequence");
     assert_eq!(n("@🐕 🐕"), None, "a space");
-    assert_eq!(n("@жон"), None, "other scripts stay out");
-    assert_eq!(n("@é"), None);
+    assert_eq!(n("@жон"), Some("@жон".into()), "other scripts: the wider extension");
+    assert_eq!(n("@é"), Some("@é".into()));
     assert_eq!(n("@🐕.doge"), None);
     assert!(handle_is_emoji("@🐕") && !handle_is_emoji("@jon"));
     // spec ba673a0: emoji and flags are characters, mixed with letters, up to 15
@@ -1251,5 +1494,76 @@ mod tests {
     // a plain-text register of an emoji handle
     assert!(matches!(parse_at_op("text/plain", "@🐕".as_bytes()), Some(AtOp::Register { handle, .. }) if handle == "@🐕"));
     assert_eq!(normalize_handle("jon", false), None);
+  }
+
+  /// The wider extension: every kind of character, never at the spec's expense.
+  #[test]
+  fn every_character_type() {
+    let n = |s: &str| normalize_handle(s, false);
+    let wide = |body: &str, handle: &str| {
+      let h = n(body).unwrap_or_else(|| panic!("{body} should be a handle"));
+      assert_eq!(h, handle, "{body}");
+      assert!(!handle_in_spec(&h), "{body} is the extension, not the spec");
+    };
+    wide("@₿illy", "@₿illy"); // the example: a currency sign
+    wide("@€uro", "@€uro");
+    wide("@∞", "@∞");
+    wide("@Élodie", "@élodie"); // lowercased
+    wide("@élodie", "@élodie"); // NFC: an accent typed apart is the same handle
+    wide("@ЖОН", "@жон");
+    wide("@太郎", "@太郎");
+    wide("@محمد", "@محمد");
+    wide("@שלום", "@שלום");
+    wide("@ñandú", "@ñandú");
+    wide("@٣", "@٣");
+    wide("@Ⅻ", "@ⅻ");
+    wide("@「jon」", "@「jon」");
+    wide("@jon¡", "@jon¡");
+    assert_eq!(parse_at_op("text/plain", "@₿illy".as_bytes()).map(|o| matches!(o, AtOp::Register { .. })), Some(true));
+    // the spec's handles are read exactly as before
+    assert_eq!(n("@Jon"), Some("@jon".into()));
+    assert!(handle_in_spec("@jon🐕"));
+    // never: mixed scripts, look-alikes of a spec handle, spaces, invisibles, ASCII punctuation, dots
+    for bad in ["@bіlly", "@Kate", "@jon doe", "@jo​n", "@jon$", "@jon-doe", "@jon.doge", "@jon․doge", "@jon／x", "@jon﹫x", "@́jon", "@", "@á́́́́́", "@jon·"] {
+      assert_eq!(n(bad), None, "{bad:?}");
+    }
+    assert_eq!(n(&format!("@{}", "ж".repeat(15))), Some(format!("@{}", "ж".repeat(15))));
+    assert_eq!(n(&format!("@{}", "ж".repeat(16))), None, "16 symbols");
+    assert_eq!(len_of("@élodie"), 6);
+    assert_eq!(bucket_of("@₿illy"), EXTENDED_BUCKET);
+    assert!(handle_confusable("@аре"), "all-Cyrillic letters that read as ape");
+    assert!(!handle_confusable("@жон") && !handle_confusable("@jon") && !handle_confusable("@₿illy"));
+  }
+
+  /// Records belong to a holding (v1.1 §5.3): a move to another address resets them; a burned
+  /// handle pays nobody.
+  #[test]
+  fn records_reset_when_the_holder_changes() {
+    let me = "D8mZsgKwmSQWYRPEMCcm8KzNFj1JVF5UpA".to_string();
+    let other = "D7gFdhQo6YPVGWW3fyXgLYbDKhuUBZqmDk".to_string();
+    let patch = |a: &str| RecordPatch { address: Some(a.to_string()), ..RecordPatch::default() };
+    let cfg = |owner: &str, pos: Pos, a: &str| HandleConfigView { inscription_id: String::new(), number: 0, height: pos.0, time: 0, owner: owner.into(), applies: false, pos, patch: patch(a) };
+    let view = |owner: &str| HandleView {
+      handle: "@jon".into(), inscription_id: String::new(), number: 0, height: 10, time: 0, owner: owner.into(), records: DnsRecords::default(),
+      configs: vec![cfg(&me, (20, 0), "D9kTcGVqHLnBgmKrW9CvB7TrJ6tqC7wHXk"), cfg(&other, (30, 0), "DBXu2kgc3xtvCUWFcxFE3r9hEYgmuaaCyD")],
+      claims: 0, pay_to: None, confusable: false, reg_pos: (10, 0), reg_patch: RecordPatch::default(),
+    };
+    // held since before its config: the record counts
+    let mut v = view(&me);
+    v.settle(|_| true);
+    assert_eq!(v.pay_to.as_deref(), Some("D9kTcGVqHLnBgmKrW9CvB7TrJ6tqC7wHXk"));
+    // sold to `other`: my config never applies to them, and theirs counts once they hold it
+    let mut v = view(&other);
+    v.settle(|p| p >= (30, 0));
+    assert_eq!(v.pay_to.as_deref(), Some("DBXu2kgc3xtvCUWFcxFE3r9hEYgmuaaCyD"));
+    // it came back to me after a sale: my old config is from before the break, so it's gone
+    let mut v = view(&me);
+    v.settle(|p| p >= (40, 0));
+    assert_eq!(v.pay_to.as_deref(), Some(me.as_str()), "pays the holder, not the old record");
+    // burned: no pay-to at all
+    let mut v = view("");
+    v.settle(|_| true);
+    assert_eq!(v.pay_to, None);
+    assert!(v.records.address.is_none());
   }
 }

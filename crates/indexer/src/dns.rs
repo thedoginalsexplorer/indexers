@@ -205,7 +205,7 @@ fn same_script(seen: &mut Option<Script>, sc: Script) -> std::result::Result<(),
 /// Characters that read as `.` or `/`. Most are punctuation or symbols and
 /// fail anyway; these are listed for the ones that are letters, digits or
 /// marks (Arabic-Indic zero, Lisu tone mark, ...).
-fn is_dot_or_slash_lookalike(c: char) -> bool {
+pub(crate) fn is_dot_or_slash_lookalike(c: char) -> bool {
   matches!(
     c as u32,
     0x00B7 | 0x0387 | 0x0589 | 0x0660 | 0x06D4 | 0x06F0 | 0x0701 | 0x0702 | 0x1427 | 0x2024 | 0x2027 | 0x2E31 | 0x2E33
@@ -215,7 +215,7 @@ fn is_dot_or_slash_lookalike(c: char) -> bool {
 }
 
 /// Unicode's Default_Ignorable_Code_Point: characters that draw nothing.
-fn is_default_ignorable(c: char) -> bool {
+pub(crate) fn is_default_ignorable(c: char) -> bool {
   matches!(
     c as u32,
     0x00AD
@@ -239,7 +239,7 @@ fn is_default_ignorable(c: char) -> bool {
 }
 
 /// Cyrillic, Greek and Armenian letters that look like an ASCII letter or digit.
-fn ascii_lookalike(c: char) -> bool {
+pub(crate) fn ascii_lookalike(c: char) -> bool {
   matches!(
     c as u32,
     // Cyrillic lower: а е о р с у х ѕ і ј һ ӏ ԁ ԛ ԝ
