@@ -157,6 +157,16 @@ const KNOWN_TREES: &[&str] = &[
   "repair_partial",
   "repair_found",
   "repair_body",
+  // Dalkanes (dalkanes/mod.rs, spec github.com/jonheaven/dalkanes): contracts and their code,
+  // storage, host ledger, output parcels, transactions, indexes, and per-block undo
+  "dalk_code",
+  "dalk_wasm",
+  "dalk_storage",
+  "dalk_ledger",
+  "dalk_parcel",
+  "dalk_tx",
+  "dalk_idx",
+  "dalk_undo",
 ];
 
 fn cf_options(write_buffer_mb: usize, cache: &Cache) -> Options {

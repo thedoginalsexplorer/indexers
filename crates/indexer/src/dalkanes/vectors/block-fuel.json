@@ -1,0 +1,126 @@
+{
+ "protocol": "dalkanes",
+ "spec_version": "0.3",
+ "source": "dogex src/indexer/updater/alkanes.rs tests block_fuel_budget_default_is_pinned, full_block_budget_runs_twenty_max_fuel_burners, block_fuel_budget_caps_and_exhausts",
+ "notes": "Per-block fuel budget (spec §6.2). Every call targets host-abi/burner.wat, which burns exactly the fuel it is granted. Calls are in tx order within one block. `budget` other than 100,000,000 is a test override of the starting balance, used to exercise the cap; it is not a protocol setting. `errors_at` keys are 0-based call positions; burner calls trap out of fuel, so they are ok:false with no state change.",
+ "constants": {
+  "BLOCK_FUEL_BUDGET": "100000000",
+  "MAX_FUEL": "5000000",
+  "exhausted_error": "block fuel budget exhausted"
+ },
+ "cases": [
+  {
+   "name": "full_budget_twenty_max_fuel_calls",
+   "budget": "100000000",
+   "requested_fuel": [
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000",
+    "9000000"
+   ],
+   "expect": {
+    "fuel_used": [
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "5000000",
+     "0"
+    ],
+    "ok": [
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false,
+     false
+    ],
+    "errors_at": {
+     "20": "block fuel budget exhausted"
+    },
+    "budget_left": "0"
+   }
+  },
+  {
+   "name": "last_call_capped_by_remaining_budget",
+   "budget": "7000000",
+   "requested_fuel": [
+    "5000000",
+    "5000000",
+    "5000000"
+   ],
+   "expect": {
+    "granted": [
+     "5000000",
+     "2000000",
+     "0"
+    ],
+    "fuel_used": [
+     "5000000",
+     "2000000",
+     "0"
+    ],
+    "ok": [
+     false,
+     false,
+     false
+    ],
+    "budget_left_after_each": [
+     "2000000",
+     "0",
+     "0"
+    ],
+    "errors_at": {
+     "2": "block fuel budget exhausted"
+    }
+   }
+  }
+ ]
+}

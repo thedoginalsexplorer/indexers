@@ -1,0 +1,73 @@
+{
+  "protocol": "dalkanes",
+  "spec_version": "0.2",
+  "constants": {
+    "op_return_magic_hex": "d1",
+    "version_hex": "01",
+    "deploy_magic_hex": "00414c4b",
+    "deploy_version_hex": "01",
+    "wasm_magic_hex": "0061736d",
+    "calldata_ptr": 4096
+  },
+  "cellpacks": [
+    {
+      "name": "cellpack_minimal",
+      "source": "original draft vectors/conformance.json",
+      "cellpack": {
+        "target_block": "100",
+        "target_tx": "1",
+        "fuel": "100000",
+        "inputs": [
+          "0"
+        ]
+      },
+      "cellpack_hex": "6401a08d060100",
+      "payload_hex": "d1016401a08d060100",
+      "script_hex": "6a09d1016401a08d060100",
+      "calldata_hex": "00000000000000000000000000000000"
+    },
+    {
+      "name": "roundtrip_cellpack",
+      "source": "dogex src/alkanes/cellpack.rs test roundtrip_cellpack",
+      "cellpack": {
+        "target_block": "100",
+        "target_tx": "1",
+        "fuel": "50000",
+        "inputs": [
+          "0",
+          "42",
+          "7"
+        ]
+      },
+      "cellpack_hex": "6401d0860303002a07",
+      "payload_hex": "d1016401d0860303002a07",
+      "script_hex": "6a0bd1016401d0860303002a07",
+      "calldata_hex": "000000000000000000000000000000002a00000000000000000000000000000007000000000000000000000000000000"
+    },
+    {
+      "name": "parse_built_script",
+      "source": "dogex src/alkanes/wire.rs test parse_built_script (build_call_script, form A)",
+      "cellpack": {
+        "target_block": "10",
+        "target_tx": "2",
+        "fuel": "1000",
+        "inputs": [
+          "99"
+        ]
+      },
+      "cellpack_hex": "0a02e8070163",
+      "payload_hex": "d1010a02e8070163",
+      "script_hex": "6a08d1010a02e8070163",
+      "calldata_hex": "63000000000000000000000000000000"
+    }
+  ],
+  "deploy_bodies": [
+    {
+      "name": "framed_deploy_prefix",
+      "source": "original draft vectors/conformance.json (deploy_magic); dogex src/indexer/envelope.rs multipart WASM envelope regression test (chunk0)",
+      "body_prefix_hex": "00414c4b010061736d01",
+      "content_type": "application/wasm",
+      "notes": "\\0ALK, version 0x01, then the start of a raw WASM module (\\0asm, version 1). Spec section 4.2 step 2."
+    }
+  ]
+}

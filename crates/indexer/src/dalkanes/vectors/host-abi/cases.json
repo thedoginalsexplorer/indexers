@@ -1,0 +1,295 @@
+{
+ "protocol": "dalkanes",
+ "spec_version": "0.3",
+ "cases": [
+  {
+   "name": "execute_tiny",
+   "source": "dogex src/alkanes/runtime.rs test execute_tiny",
+   "module": "execute_tiny.wat",
+   "params": {
+    "fuel": 100000,
+    "height": 1,
+    "tx_index": 0,
+    "block_time": 1700000000,
+    "calldata_hex": "",
+    "storage": {}
+   },
+   "expect": {
+    "ok": true,
+    "return_hex": "6f6b"
+   }
+  },
+  {
+   "name": "staticcall_reads_child_height",
+   "source": "dogex src/alkanes/runtime.rs test staticcall_height_from_oracle_like",
+   "module": "staticcall_parent.wat",
+   "contracts": {
+    "9:1": "staticcall_child.wat"
+   },
+   "params": {
+    "fuel": 500000,
+    "height": 42,
+    "tx_index": 0,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": ""
+   },
+   "expect": {
+    "ok": true,
+    "return_hex": "2a00000000000000"
+   }
+  },
+  {
+   "name": "attached_value_and_incoming_layout",
+   "source": "dogex src/alkanes/runtime.rs test alkane_value_and_incoming_host",
+   "module": "value_and_incoming.wat",
+   "params": {
+    "fuel": 100000,
+    "height": 1,
+    "tx_index": 0,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "attached_value": 42000,
+    "incoming": [
+     {
+      "token_block": 9,
+      "token_tx": 1,
+      "amount": "777"
+     }
+    ]
+   },
+   "expect": {
+    "ok": true,
+    "decoded": {
+     "value_i64_le_at_0": 42000,
+     "incoming_count_i32_le_at_8": 1,
+     "token_block_u64_le_at_16": 9,
+     "amount_u128_le_at_32": "777"
+    }
+   }
+  },
+  {
+   "name": "lazy_storage_and_missing_key",
+   "source": "dogex src/alkanes/runtime.rs test large_storage_reads_lazily_and_missing_is_empty",
+   "module": "lazy_storage.wat",
+   "params": {
+    "fuel": 1000000,
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "state_storage": {
+     "1:0": {
+      "generator": "for i in 0..20000: key = u64 LE(i), value = u32 LE(i)"
+     }
+    }
+   },
+   "expect": {
+    "ok": true,
+    "return_hex": "04000000393000000000000000000000"
+   },
+   "notes": "20,000 stored keys load lazily (no key cap). Bytes 0..4: length read for key 12345 (4); 4..8: its value; 12..16: a missing key reads as length 0."
+  },
+  {
+   "name": "nested_call_storage_namespaces",
+   "source": "dogex src/alkanes/runtime.rs test nested_call_writes_land_in_callee_namespace",
+   "module": "nested_parent.wat",
+   "contracts": {
+    "9:2": "counter_child.wat"
+   },
+   "params": {
+    "fuel": 1000000,
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": ""
+   },
+   "expect": {
+    "ok": true,
+    "storage_writes": {
+     "1:0": {
+      "6b": "ee"
+     },
+     "9:2": {
+      "6b": "0200000000000000"
+     }
+    }
+   },
+   "notes": "Parent writes k=ee, calls the counter twice (2), then staticcalls it (sees 2, returns 3, discarded). Each contract's writes commit under its own id."
+  },
+  {
+   "name": "self_transfer_is_a_no_op",
+   "source": "dogex src/alkanes/runtime.rs test self_transfer_does_not_inflate",
+   "module": "self_transfer.wat",
+   "params": {
+    "fuel": 1000000,
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "5:0",
+    "caller": "0:0",
+    "calldata_hex": ""
+   },
+   "expect": {
+    "ok": true,
+    "return_hex": "64000000000000000000000000000000",
+    "ledger_writes": {
+     "00000000000000050000000041": "100"
+    }
+   },
+   "notes": "Mint 100 to account 'A', transfer A→A 60 twice (both return 1), A→A 101 returns 0; balance stays 100."
+  },
+  {
+   "name": "sender_top_level_only",
+   "source": "dogex src/alkanes/runtime.rs test sender_visible_only_at_top_level",
+   "module": "sender_parent.wat",
+   "contracts": {
+    "9:3": "sender_child.wat"
+   },
+   "params": {
+    "fuel": 1000000,
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "sender_hex": "4242424242424242424242424242424242424242"
+   },
+   "expect": {
+    "ok": true,
+    "decoded": {
+     "sender_len_i32_le_at_0": 20,
+     "sender_at_8": "4242424242424242424242424242424242424242",
+     "child_sender_len_i32_le_at_40": -1
+    }
+   },
+   "notes": "With no sender the parent reads -1 at offset 0."
+  },
+  {
+   "name": "failed_child_writes_rolled_back",
+   "source": "dogex src/alkanes/runtime.rs test failed_child_writes_are_rolled_back",
+   "module": "rollback_parent_failed_child.wat",
+   "contracts": {
+    "9:2": "writer_child_fail.wat"
+   },
+   "params": {
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "fuel": 1000000
+   },
+   "expect": {
+    "ok": true,
+    "contract_writes": {
+     "1:0": {
+      "6b": "ee"
+     }
+    },
+    "ledger_writes": {}
+   }
+  },
+  {
+   "name": "bad_return_buffer_discards_child",
+   "source": "dogex src/alkanes/runtime.rs test bad_return_buffer_discards_child_writes",
+   "module": "rollback_parent_bad_buffer.wat",
+   "contracts": {
+    "9:2": "writer_child_ok.wat"
+   },
+   "params": {
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "fuel": 1000000
+   },
+   "expect": {
+    "ok": true,
+    "contract_writes": {
+     "1:0": {
+      "6b": "ee"
+     }
+    },
+    "ledger_writes": {}
+   }
+  },
+  {
+   "name": "grandchild_rolls_back_with_failed_middle",
+   "source": "dogex src/alkanes/runtime.rs test grandchild_commit_rolls_back_with_failed_middle_frame",
+   "module": "rollback_parent_grandchild.wat",
+   "contracts": {
+    "9:2": "writer_child_ok.wat",
+    "9:3": "rollback_middle.wat"
+   },
+   "params": {
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "fuel": 1000000
+   },
+   "expect": {
+    "ok": true,
+    "contract_writes": {
+     "1:0": {
+      "6b": "ee"
+     },
+     "9:2": {
+      "6b": "0100000000000000"
+     }
+    },
+    "ledger_writes_note": "exactly one mint of 5 to token 9:2 account 'A' (0x41)"
+   }
+  },
+  {
+   "name": "start_function_out_of_fuel",
+   "source": "dogex src/alkanes/runtime.rs test setup_failure_reports_fuel_burned",
+   "module": "start_spin.wat",
+   "params": {
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "fuel": 100000
+   },
+   "expect": {
+    "ok": false,
+    "fuel_used": 100000
+   }
+  },
+  {
+   "name": "missing_export_after_start",
+   "source": "dogex src/alkanes/runtime.rs test setup_failure_reports_fuel_burned",
+   "module": "start_no_export.wat",
+   "params": {
+    "height": 50,
+    "tx_index": 3,
+    "block_time": 0,
+    "myself": "1:0",
+    "caller": "0:0",
+    "calldata_hex": "",
+    "fuel": 1000000
+   },
+   "expect": {
+    "ok": false,
+    "fuel_used_gt": 1000
+   }
+  }
+ ]
+}

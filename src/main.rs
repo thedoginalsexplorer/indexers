@@ -163,6 +163,18 @@ async fn run() -> Result<()> {
     }
   });
 
+  // Ðalkanes: WASM contracts (github.com/jonheaven/dalkanes), run block by block
+  // from mainnet activation (6,466,500) in the pinned interpreter, wasmi 1.1.0.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    loop {
+      if let Err(e) = dogeord_indexer::run_dalkanes_index(c.clone()).await {
+        error!("dalkanes index stopped, restarting in a minute: {e:#}");
+      }
+      tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+  });
+
   // D:// (DogeFeed's protocol): posts, comments, quotes and their payments,
   // checked against the registrar, following the main index.
   let c = cfg.clone();

@@ -1,0 +1,96 @@
+{
+  "protocol": "dalkanes",
+  "spec_version": "0.2",
+  "source": "dogex src/alkanes/wire.rs test strict_parser_vectors (mirrored in dogexplorer src/lib/alkanes.test.ts and WatchDoge tests/alkanesDetect.test.ts)",
+  "notes": "Each script_hex is one output script. valid = the reference indexer parses it as a call. For valid cases, target and fuel are the decoded values (fuel before the MAX_FUEL clamp).",
+  "cases": [
+    {
+      "name": "canonical",
+      "script_hex": "6a08d1010a02e8070163",
+      "valid": true,
+      "target": "10:2",
+      "fuel": "1000"
+    },
+    {
+      "name": "three_push",
+      "script_hex": "6a01d10101060a02e8070163",
+      "valid": true,
+      "target": "10:2",
+      "fuel": "1000"
+    },
+    {
+      "name": "two_push",
+      "script_hex": "6a01d107010a02e8070163",
+      "valid": true,
+      "target": "10:2",
+      "fuel": "1000"
+    },
+    {
+      "name": "no_version_single",
+      "script_hex": "6a07d10a02e8070163",
+      "valid": false
+    },
+    {
+      "name": "no_version_two",
+      "script_hex": "6a01d1060a02e8070163",
+      "valid": false
+    },
+    {
+      "name": "wrong_version",
+      "script_hex": "6a08d1020a02e8070163",
+      "valid": false
+    },
+    {
+      "name": "wide_magic",
+      "script_hex": "6a02d1000101060a02e8070163",
+      "valid": false
+    },
+    {
+      "name": "truncated_cellpack",
+      "script_hex": "6a07d1010a02e80701",
+      "valid": false
+    },
+    {
+      "name": "missing_fuel_count",
+      "script_hex": "6a04d1010a02",
+      "valid": false
+    },
+    {
+      "name": "tx_overflow",
+      "script_hex": "6a0bd101058080808010e80700",
+      "valid": false
+    },
+    {
+      "name": "block_overflow",
+      "script_hex": "6a10d1018080808080808080800200e80700",
+      "valid": false
+    },
+    {
+      "name": "input_count_257",
+      "script_hex": "6a08d1010500e8078102",
+      "valid": false
+    },
+    {
+      "name": "input_count_huge",
+      "script_hex": "6a11d1010500e8078180808080808080800207",
+      "valid": false
+    },
+    {
+      "name": "input_u128_overflow",
+      "script_hex": "6a1ad1010a02e80701ffffffffffffffffffffffffffffffffffff04",
+      "valid": false
+    },
+    {
+      "name": "fuel_saturates",
+      "script_hex": "6a19d1010a02ffffffffffffffffffffffffffffffffffff030163",
+      "valid": true,
+      "target": "10:2",
+      "fuel": "18446744073709551615"
+    },
+    {
+      "name": "truncated_push",
+      "script_hex": "6a08d1010a02",
+      "valid": false
+    }
+  ]
+}

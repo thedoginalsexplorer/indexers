@@ -9,6 +9,7 @@ mod repair;
 mod renumber;
 mod drc20_replay;
 mod dfeed;
+pub mod dalkanes;
 mod dunes;
 mod dune_replay;
 pub mod bootstrap;
@@ -32,6 +33,7 @@ pub use drc20_replay::{
 };
 pub use dune_replay::{DuneReplayStatus, dune_replay_failed, dune_replay_status, dunes_rebuilt, run_dune_replay};
 pub use dunes::{Entry as DuneProtocolEntry, dune_entries, dune_entry, dune_holders_built, dune_number, format_id as format_dune_id};
+pub use dalkanes::run_dalkanes_index;
 pub use dfeed::{DfRecord, DfeedStatus, dfeed_by_account, dfeed_by_inscription, dfeed_by_txid, dfeed_pointing_at, dfeed_records, dfeed_status, run_dfeed_index};
 
 pub use tap::{

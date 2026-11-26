@@ -1,0 +1,13 @@
+(module
+  (import "env" "storage_get" (func $get (param i32 i32 i32 i32) (result i32)))
+  (import "env" "return_data" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\39\30\00\00\00\00\00\00")
+  (data (i32.const 8) "\ff\ff\ff\ff\ff\ff\ff\ff")
+  (func (export "__dalk_execute") (param i32 i32) (result i32)
+    (i32.store (i32.const 100)
+      (call $get (i32.const 0) (i32.const 8) (i32.const 104) (i32.const 8)))
+    (i32.store (i32.const 112)
+      (call $get (i32.const 8) (i32.const 8) (i32.const 116) (i32.const 8)))
+    (call $ret (i32.const 100) (i32.const 16))
+    (i32.const 0)))

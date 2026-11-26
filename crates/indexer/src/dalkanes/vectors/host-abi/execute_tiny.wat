@@ -1,0 +1,16 @@
+;; Source: dogex src/alkanes/runtime.rs, tiny_wasm() / test execute_tiny
+(module
+  (import "env" "return_data" (func $ret (param i32 i32)))
+  (import "env" "storage_get" (func $get (param i32 i32 i32 i32) (result i32)))
+  (import "env" "storage_set" (func $set (param i32 i32 i32 i32)))
+  (import "env" "log" (func $log (param i32 i32)))
+  (import "env" "alkane_block" (func $blk (result i64)))
+  (import "env" "alkane_tx" (func $tx (result i64)))
+  (import "env" "alkane_time" (func $tm (result i64)))
+  (import "env" "sha256" (func $sha (param i32 i32 i32) (result i32)))
+  (import "env" "verify_schnorr" (func $vs (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "ok")
+  (func (export "__dalk_execute") (param i32 i32) (result i32)
+    (call $ret (i32.const 0) (i32.const 2))
+    (i32.const 0)))

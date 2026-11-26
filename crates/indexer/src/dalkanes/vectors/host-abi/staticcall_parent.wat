@@ -1,0 +1,15 @@
+;; Source: dogex src/alkanes/runtime.rs, test staticcall_height_from_oracle_like (parent, 1:0)
+(module
+  (import "env" "staticcall" (func $sc (param i64 i64 i32 i32 i32 i32 i64) (result i32)))
+  (import "env" "return_data" (func $ret (param i32 i32)))
+  (memory (export "memory") 2)
+  (func (export "__dalk_execute") (param i32 i32) (result i32)
+    (local $n i32)
+    (local.set $n (call $sc
+      (i64.const 9) (i64.const 1)
+      (i32.const 0) (i32.const 0)
+      (i32.const 100) (i32.const 8)
+      (i64.const 200000)))
+    (if (i32.lt_s (local.get $n) (i32.const 8)) (then (i32.const 1) (return)))
+    (call $ret (i32.const 100) (i32.const 8))
+    (i32.const 0)))
