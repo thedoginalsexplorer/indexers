@@ -1880,6 +1880,10 @@ mod tests {
     let mut parent = h0.to_le_bytes().to_vec();
     parent.extend_from_slice(&1u64.to_le_bytes());
     assert_eq!(t.get(T_STORAGE, &storage_key((h0 + 1, 1), &[0x12])).unwrap(), Some(parent));
+    // §20: the program remembers the block and the address, the address with the single byte 0x01
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x14])).unwrap().map(|v| u64_le(&v)), Some(h0 + 1));
+    let k1h = sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &k1).serialize());
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[&[0x15u8][..], &k1h[..]].concat())).unwrap(), Some(vec![0x01]));
     // the same address again: refused before execution, no id
     let r = pull(h0 + 2, program, &k1, &mut st);
     let rc = r.receipt.unwrap();
