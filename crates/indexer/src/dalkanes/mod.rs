@@ -55,6 +55,8 @@ const CANON: &[(&str, &str, &str)] = &[
   // 2026-11-26 builds with the collection views (§20, §21) and Kibble (§18)
   ("7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694", "proof", "Proof"),
   ("9e9bfc0422676b8d7c76597fb08a8645c90ab15ecd378e32f927cf54084cf345", "shibkane", "Shibkane"),
+  // Doge Orbital (§23, kind "doge"): same births and gate as Proof. Its canonical hash is added here
+  // once dogex publishes /api/alkanes/doge/build (nothing is inscribed yet).
   ("ee4c6e7ba6096c1ed5908485135a107f793f8295c2baa0c6e4734a8c9e16a3dd", "kibble", "Kibble"),
   // builds with baked ids, as deployed on mainnet (Collar: Howl, Ash, Vigil; Bone: Howl)
   ("66c3610d07e8f2fee6db975f52fe41c74bae826847cbc446146ae42334b315c0", "collar", "Collar"),
@@ -709,7 +711,7 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
   let code = ctx.view.code(target, ctx.height, i)?;
   // §20: opcode 77 on an inscribed Proof or Shibkane program births a print, the pull's own block:tx,
   // and the program runs as that id
-  let print_program = matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof" | "shibkane", _)));
+  let print_program = matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof" | "shibkane" | "doge", _)));
   let birth = print_program && c.cp.inputs.first() == Some(&77) && !ctx.view.is_print(target, &ctx.births);
   let born: Id = (ctx.height, i);
   let value = tx.vout.iter().find(|o| o.n == c.carrier).and_then(|o| crate::to_satoshis(o.value).ok()).unwrap_or(0);
@@ -727,7 +729,7 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
   }
   // §20/§21 (spec 1f80b65): Proof and Shibkane collections share the gate: 420 prints, one pull per
   // block, one per verified sender
-  let proof = birth && matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof" | "shibkane", _)));
+  let proof = birth && matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof" | "shibkane" | "doge", _)));
   if proof {
     // §20: a Proof collection stops at 420, one pull per block and one per verified sender. Refused
     // before execution: no fuel, no new id, and the block and the address are not used up.
@@ -1423,7 +1425,7 @@ pub fn dalk_contract(config: &Config, id: Id) -> Result<Option<ContractDetail>> 
   })?;
   let storage_keys = count_prefix(&t.t[T_STORAGE as usize], &me)?;
   let st = |key: &[u8]| -> Result<Option<Vec<u8>>> { t.get(T_STORAGE, &storage_key(id, key)) };
-  let orbital = if matches!(summary.kind.as_deref(), Some("proof" | "shibkane")) {
+  let orbital = if matches!(summary.kind.as_deref(), Some("proof" | "shibkane" | "doge")) {
     if let Some(parent) = summary.meta.program.clone() {
       Some(serde_json::json!({ "standard": "dalkane-orbital/1", "parent": parent, "index": st(&[0x13])?.map(|v| u64_le(&v)) }))
     } else {
@@ -1667,8 +1669,8 @@ fn simulate_at(db: &store::Db, height: u64, time: u64, target: Id, inputs: &[u12
     if let Some(code) = base.code(target, height, tx) {
       let kind = canon_of(&hex::encode(Sha256::digest(&code[..]))).map(|c| c.0);
       let is_print = db.open_tree("dalk_code")?.get(id_key(target))?.and_then(|v| serde_json::from_slice::<DeployMeta>(v.as_ref()).ok()).is_some_and(|m| m.program.is_some());
-      if matches!(kind, Some("proof" | "shibkane")) && !is_print {
-        if matches!(kind, Some("proof" | "shibkane")) {
+      if matches!(kind, Some("proof" | "shibkane" | "doge")) && !is_print {
+        if matches!(kind, Some("proof" | "shibkane" | "doge")) {
           if let Some(why) = proof_refusal(&base, target, height, sender) {
             return Ok(SimOutcome { result: vm::CallResult { ok: false, error: Some(why.into()), ..Default::default() }, born: None });
           }
