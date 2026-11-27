@@ -38,7 +38,7 @@ const STATE_KEY: &[u8] = b"dalk_state_v1";
 /// activation (about a minute): 2 = spec v0.4 edge-case pass (strict call forms, the pointer as a
 /// deposit, print births, 2026-11-26); 3 = deployers, project cards (§22), the Proof gate and
 /// collection keys (§20), 2026-11-27; 4 = per-address history (`w|address|…`), 2026-11-27.
-const RULES: u64 = 4;
+const RULES: u64 = 5;
 const RULES_KEY: &[u8] = b"dalk_rules";
 /// Undo records and block hashes kept for reorgs.
 const KEEP: u64 = 200;
@@ -458,8 +458,25 @@ fn addr_key(addr: &str, outpoint: &[u8]) -> Vec<u8> {
   k
 }
 
-/// Prints a Proof collection may bear (§20).
+/// Prints a Proof or Shibkane collection may bear (§20, §21 since spec 1f80b65).
 const PROOF_CAP: u64 = 420;
+
+/// §20: why a Proof pull at `height` from `sender` is refused before execution, if it is: the collection
+/// is full, this block already pulled, or this address already pulled. Shared by the block and the dry run.
+fn proof_refusal(view: &dyn StateView, program: Id, height: u64, sender: Option<[u8; 20]>) -> Option<&'static str> {
+  let count = view.storage(program, &[0x10]).map(|v| u64_le(&v)).unwrap_or(0);
+  let last = view.storage(program, &[0x14]).map(|v| u64_le(&v));
+  let pulled = sender.is_some_and(|s| view.storage(program, &[&[0x15u8][..], &s[..]].concat()).is_some());
+  if count >= PROOF_CAP {
+    Some("the collection is full")
+  } else if last == Some(height) {
+    Some("this block already pulled")
+  } else if pulled {
+    Some("this address already pulled")
+  } else {
+    None
+  }
+}
 
 fn u64_le(v: &[u8]) -> u64 {
   let mut b = [0u8; 8];
@@ -708,23 +725,13 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("print birth refused: this transaction already has an id".into()), ..Default::default() });
     return None;
   }
-  let proof = birth && matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof", _)));
+  // §20/§21 (spec 1f80b65): Proof and Shibkane collections share the gate: 420 prints, one pull per
+  // block, one per verified sender
+  let proof = birth && matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof" | "shibkane", _)));
   if proof {
     // §20: a Proof collection stops at 420, one pull per block and one per verified sender. Refused
     // before execution: no fuel, no new id, and the block and the address are not used up.
-    let count = ctx.view.storage(target, &[0x10]).map(|v| u64_le(&v)).unwrap_or(0);
-    let last = ctx.view.storage(target, &[0x14]).map(|v| u64_le(&v));
-    let pulled = sender.is_some_and(|s| ctx.view.storage(target, &[&[0x15u8][..], &s[..]].concat()).is_some());
-    let refused = if count >= PROOF_CAP {
-      Some("the collection is full")
-    } else if last == Some(ctx.height) {
-      Some("this block already pulled")
-    } else if pulled {
-      Some("this address already pulled")
-    } else {
-      None
-    };
-    if let Some(why) = refused {
+    if let Some(why) = proof_refusal(&*ctx.view, target, ctx.height, sender) {
       rec.receipt = Some(Receipt { target: fmt_id(target), error: Some(why.into()), ..Default::default() });
       return None;
     }
@@ -1361,12 +1368,17 @@ fn summary(config: &Config, t: &Trees, meta: DeployMeta, height: u64) -> Result<
 }
 
 /// Contracts, newest first.
-pub fn dalk_contracts(config: &Config, offset: usize, limit: usize) -> Result<(Vec<ContractSummary>, usize)> {
+/// Inscribed contracts, newest first. `prints: false` leaves out the ids born by a pull (§20), so the
+/// factories and tokens can't be pushed off a page by a collection's prints.
+pub fn dalk_contracts(config: &Config, offset: usize, limit: usize, prints: bool) -> Result<(Vec<ContractSummary>, usize)> {
   let t = read_trees(config)?;
   let height = load_state(&t.meta)?.next_height.saturating_sub(1);
   let mut all = Vec::new();
   t.t[T_CODE as usize].for_each_rev_from(b"", |_, v| {
-    all.push(serde_json::from_slice::<DeployMeta>(v)?);
+    let m = serde_json::from_slice::<DeployMeta>(v)?;
+    if prints || m.program.is_none() {
+      all.push(m);
+    }
     Ok(true)
   })?;
   let total = all.len();
@@ -1607,25 +1619,81 @@ pub(crate) fn parcels_on(db: &store::Db, outpoints: &[&str]) -> Result<Vec<Vec<(
     .collect()
 }
 
+/// What a dry run reports: the call's result and, for a print birth (§20), the id it ran as.
+pub struct SimOutcome {
+  pub result: vm::CallResult,
+  /// The id a successful pull would give its print. The real id is the pull's own block:tx, known
+  /// only once it is mined; the dry run uses the next block and index 1.
+  pub born: Option<Id>,
+}
+
+/// Committed state, plus the program's code under the id a birth would take (§20).
+struct SimView {
+  db: DbView,
+  born: Option<(Id, Rc<Vec<u8>>)>,
+}
+
+impl StateView for SimView {
+  fn code(&self, id: Id, h: u64, tx: u32) -> Option<Rc<Vec<u8>>> {
+    match &self.born {
+      Some((b, code)) if *b == id => Some(code.clone()),
+      _ => self.db.code(id, h, tx),
+    }
+  }
+  fn storage(&self, id: Id, key: &[u8]) -> Option<Vec<u8>> {
+    self.db.storage(id, key)
+  }
+  fn ledger(&self, key: &[u8]) -> u128 {
+    self.db.ledger(key)
+  }
+}
+
 /// A dry run of a top-level call against committed state at the next block: what a wallet asks
 /// before it signs. `sender` is the verified sender's 20-byte hash, `value` the koinu the carrier
-/// would burn. Nothing is written.
-pub fn dalk_simulate(config: &Config, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>) -> Result<vm::CallResult> {
+/// would burn. Nothing is written. Opcode 77 on an inscribed Proof or Shibkane program runs as the
+/// block does (§20): a Proof's gate first, then the program as the new id with the program as caller.
+pub fn dalk_simulate(config: &Config, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>) -> Result<SimOutcome> {
   let db = ii::db_of(config)?;
   let meta = load_state(&db.open_tree("meta")?)?;
-  let view: Rc<dyn StateView> = Rc::new(DbView { wasm: db.open_tree("dalk_wasm")?, storage: db.open_tree("dalk_storage")?, ledger: db.open_tree("dalk_ledger")? });
+  let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+  simulate_at(&db, meta.next_height, now, target, inputs, value, sender)
+}
+
+fn simulate_at(db: &store::Db, height: u64, time: u64, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>) -> Result<SimOutcome> {
+  let base = DbView { wasm: db.open_tree("dalk_wasm")?, storage: db.open_tree("dalk_storage")?, ledger: db.open_tree("dalk_ledger")? };
+  let tx = 1u32;
+  let mut birth: Option<(Id, Rc<Vec<u8>>)> = None;
+  if inputs.first() == Some(&77) {
+    if let Some(code) = base.code(target, height, tx) {
+      let kind = canon_of(&hex::encode(Sha256::digest(&code[..]))).map(|c| c.0);
+      let is_print = db.open_tree("dalk_code")?.get(id_key(target))?.and_then(|v| serde_json::from_slice::<DeployMeta>(v.as_ref()).ok()).is_some_and(|m| m.program.is_some());
+      if matches!(kind, Some("proof" | "shibkane")) && !is_print {
+        if matches!(kind, Some("proof" | "shibkane")) {
+          if let Some(why) = proof_refusal(&base, target, height, sender) {
+            return Ok(SimOutcome { result: vm::CallResult { ok: false, error: Some(why.into()), ..Default::default() }, born: None });
+          }
+        }
+        birth = Some(((height, tx), code));
+      }
+    }
+  }
+  let born = birth.as_ref().map(|(b, _)| *b);
   let env = vm::CallEnv {
-    height: meta.next_height,
-    tx: 1,
-    time: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-    target,
+    height,
+    tx,
+    time,
+    target: born.unwrap_or(target),
     fuel: vm::MAX_FUEL,
     calldata: vm::calldata(inputs),
     value,
     sender,
+    caller: if born.is_some() { target } else { (0, 0) },
     ..Default::default()
   };
-  Ok(vm::execute(&ENGINE, view, &env))
+  let view: Rc<dyn StateView> = Rc::new(SimView { db: base, born: birth });
+  let result = vm::execute(&ENGINE, view, &env);
+  let born = born.filter(|_| result.ok);
+  Ok(SimOutcome { result, born })
 }
 
 pub fn dalk_code(config: &Config, id: Id) -> Result<Option<Vec<u8>>> {
@@ -1944,6 +2012,82 @@ mod tests {
     assert!(t.get(T_CODE, &id_key((h0 + 3, 1))).unwrap().is_none());
     assert!(slot(1).is_none());
     assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(1));
+
+    // the dry run a wallet asks before a pull (§20): the gate, then the birth as the next block's id
+    let k2h = sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &k2).serialize());
+    let next = h0 + 3;
+    let sim = simulate_at(&db, next, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
+    assert!(sim.result.ok, "{:?}", sim.result.error);
+    assert_eq!(sim.born, Some((next, 1)));
+    assert_eq!(sim.result.outgoing, vec![((next, 1), 1, 1)]);
+    // k1 already pulled: refused before execution, no id, no fuel
+    let sim = simulate_at(&db, next, 0, program, &[77, 1], 0, Some(k1h)).unwrap();
+    assert_eq!((sim.result.ok, sim.result.fuel_used, sim.result.error.as_deref(), sim.born), (false, 0, Some("this address already pulled"), None));
+    // the block that last pulled is refused too
+    let sim = simulate_at(&db, h0 + 1, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
+    assert_eq!(sim.result.error.as_deref(), Some("this block already pulled"));
+    // 77 on a print is not a birth
+    let sim = simulate_at(&db, next, 0, (h0 + 1, 1), &[77, 1], 0, Some(k2h)).unwrap();
+    assert!(!sim.result.ok && sim.born.is_none());
+  }
+
+  /// §21 (spec 1f80b65): a Shibkane collection has Proof's gate: one pull per address and per block,
+  /// refused before execution with no fuel and no id, and the dry run says so too.
+  #[test]
+  fn shibkane_gate() {
+    let db = store::Db::temporary().unwrap();
+    let t = Trees::open(&db).unwrap();
+    let body = hex::decode(include_str!("vectors/shibkane-deploy.hex").trim()).unwrap();
+    let h0 = 6_490_000u64;
+    let insc = format!("{}i0", "cd".repeat(32));
+    t.seq.insert(ii::seq_key(h0, 1), bincode::serialize(&SeqEntry { id: insc.clone(), kinds: 0, time: 0 }).unwrap()).unwrap();
+    t.content.insert(insc.as_bytes(), bincode::serialize(&crate::InscriptionContentRecord { content_type: "application/wasm".into(), body, delegate: None }).unwrap()).unwrap();
+    let mut st = State { next_height: h0 + 1, ..Default::default() };
+    let mut txs = filler(1, h0);
+    txs.push(txj(&"cd".repeat(32), serde_json::json!([{}]), serde_json::json!([{ "value": 0.001, "n": 0, "scriptPubKey": { "hex": "51" } }])));
+    index_block(&db, &t, h0, &block(h0, txs), &HashMap::new(), &st).unwrap();
+    let meta: DeployMeta = serde_json::from_slice(&t.get(T_CODE, &id_key((h0, 1))).unwrap().unwrap()).unwrap();
+    assert_eq!(canon_of(&meta.code_hash).map(|c| c.0), Some("shibkane"));
+    let k1 = secp256k1::SecretKey::from_slice(&[11u8; 32]).unwrap();
+    let k2 = secp256k1::SecretKey::from_slice(&[13u8; 32]).unwrap();
+    let p2pkh = hex::decode("76a914000000000000000000000000000000000000000088ac").unwrap();
+    let program = (h0, 1);
+    let pull = |h: u64, key: &secp256k1::SecretKey, st: &mut State| -> TxRecord {
+      let raw = signed_call(key, program, &[77, 1], &p2pkh);
+      let txid = format!("{:064x}", h + 7);
+      let mut txs = filler(1, h);
+      txs.push(call_tx(&txid, &raw));
+      let mut rawmap = HashMap::new();
+      rawmap.insert(txid.clone(), raw);
+      st.next_height = h + 1;
+      index_block(&db, &t, h, &block(h, txs), &rawmap, st).unwrap();
+      serde_json::from_slice(&t.get(T_TX, txid.as_bytes()).unwrap().unwrap()).unwrap()
+    };
+    let r = pull(h0 + 1, &k1, &mut st);
+    let rc = r.receipt.unwrap();
+    assert!(rc.ok, "{:?}", rc.error);
+    assert_eq!(rc.born.as_deref(), Some(fmt_id((h0 + 1, 1)).as_str()));
+    let k1h = sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &k1).serialize());
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x14])).unwrap().map(|v| u64_le(&v)), Some(h0 + 1));
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[&[0x15u8][..], &k1h[..]].concat())).unwrap(), Some(vec![0x01]));
+    // the same address again: refused before execution, fuel 0, no id (the open collection would have born a second)
+    let r = pull(h0 + 2, &k1, &mut st);
+    let rc = r.receipt.unwrap();
+    assert_eq!((rc.ok, rc.fuel_used, rc.error.as_deref(), rc.born.is_none()), (false, 0, Some("this address already pulled"), true));
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(1));
+    // the dry run: refused for k1 and in the block that last pulled; k2 births at the next block
+    let sim = simulate_at(&db, h0 + 3, 0, program, &[77, 1], 0, Some(k1h)).unwrap();
+    assert_eq!((sim.result.ok, sim.result.error.as_deref(), sim.born), (false, Some("this address already pulled"), None));
+    let k2h = sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &k2).serialize());
+    let sim = simulate_at(&db, h0 + 1, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
+    assert_eq!(sim.result.error.as_deref(), Some("this block already pulled"));
+    let sim = simulate_at(&db, h0 + 3, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
+    assert!(sim.result.ok, "{:?}", sim.result.error);
+    assert_eq!(sim.born, Some((h0 + 3, 1)));
+    // another address births the second print
+    let r = pull(h0 + 3, &k2, &mut st);
+    assert_eq!(r.receipt.unwrap().born.as_deref(), Some(fmt_id((h0 + 3, 1)).as_str()));
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(2));
   }
 
   /// §22.1: the card body, under the schema.
