@@ -37,8 +37,8 @@ const STATE_KEY: &[u8] = b"dalk_state_v1";
 /// The rules this index was built with. Raising it clears the Dalkanes trees and replays from
 /// activation (about a minute): 2 = spec v0.4 edge-case pass (strict call forms, the pointer as a
 /// deposit, print births, 2026-11-26); 3 = deployers, project cards (§22), the Proof gate and
-/// collection keys (§20), 2026-11-27.
-const RULES: u64 = 3;
+/// collection keys (§20), 2026-11-27; 4 = per-address history (`w|address|…`), 2026-11-27.
+const RULES: u64 = 4;
 const RULES_KEY: &[u8] = b"dalk_rules";
 /// Undo records and block hashes kept for reorgs.
 const KEEP: u64 = 200;
@@ -153,6 +153,9 @@ pub struct TxRecord {
   pub receipt: Option<Receipt>,
   /// Parcels the inputs carried in.
   pub parcels_in: Vec<Amount>,
+  /// Addresses whose outputs held those parcels (who sent them).
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub parcels_from: Vec<String>,
   /// Parcels placed on this transaction's outputs.
   pub parcels_out: Vec<OutParcel>,
   pub burned: Vec<Amount>,
@@ -435,6 +438,15 @@ fn holder_key(token: Id, addr: &str, outpoint: &[u8]) -> Vec<u8> {
   k.extend_from_slice(addr.as_bytes());
   k.push(b'|');
   k.extend_from_slice(outpoint);
+  k
+}
+
+/// `w|address|height‖tx` -> txid: what an address did with Ðalkanes, in chain order.
+fn addr_history_key(addr: &str, height: u64, tx: u32) -> Vec<u8> {
+  let mut k = b"w|".to_vec();
+  k.extend_from_slice(addr.as_bytes());
+  k.push(b'|');
+  k.extend_from_slice(&hk(height, tx));
   k
 }
 
@@ -775,7 +787,7 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     if proof {
       s.insert((target, vec![0x14]), ctx.height.to_le_bytes().to_vec());
       if let Some(snd) = sender {
-        // §20: the stored value is the single byte 0x01 (the gate only checks that the key exists)
+        // §20 (spec 071cff3): the value is the single byte 0x01, as dogex stores it
         s.insert((target, [&[0x15u8][..], &snd[..]].concat()), vec![0x01]);
       }
     }
@@ -880,6 +892,7 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
     let i = idx as u32;
     // parcels the inputs carry
     let mut gathered: BTreeMap<Id, u128> = BTreeMap::new();
+    let mut from_addrs: Vec<String> = Vec::new();
     for vin in &tx.vin {
       let (Some(ptx), Some(pv)) = (vin.txid.as_deref(), vin.vout) else { continue };
       let pk = parcel_key(ptx, pv);
@@ -894,6 +907,9 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
       }
       if let Some(addr) = &p.address {
         w.put(T_IDX, addr_key(addr, &pk), None);
+        if !from_addrs.contains(addr) {
+          from_addrs.push(addr.clone());
+        }
       }
       w.put(T_PARCEL, pk, None);
     }
@@ -912,6 +928,7 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
       deploy: deployed.then(|| fmt_id((height, i))),
       message: "none".into(),
       parcels_in: amounts(&gathered),
+      parcels_from: from_addrs.clone(),
       ..Default::default()
     };
     let can_hold = |v: u32| is_op_return(tx, v) == Some(false);
@@ -1025,6 +1042,16 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
     let mut tk = b"t|".to_vec();
     tk.extend_from_slice(&hk(height, i));
     w.put(T_IDX, tk, Some(tx.txid.clone().into_bytes()));
+    // per-address history: the verified sender, every address whose parcels were spent, every address
+    // that received some
+    let mut who: Vec<String> = from_addrs;
+    who.extend(rec.sender.iter().cloned());
+    who.extend(rec.parcels_out.iter().filter_map(|o| o.address.clone()));
+    who.sort();
+    who.dedup();
+    for a in who {
+      w.put(T_IDX, addr_history_key(&a, height, i), Some(tx.txid.clone().into_bytes()));
+    }
     w.put(T_TX, tx.txid.clone().into_bytes(), Some(serde_json::to_vec(&rec)?));
     n_tx += 1;
   }
@@ -1458,6 +1485,15 @@ pub fn dalk_activity(config: &Config, offset: usize, limit: usize) -> Result<(Ve
   records_from(&t, b"t|", offset, limit)
 }
 
+/// An address's Ðalkanes history (claims it made, units it received or sent), newest first.
+pub fn dalk_address_activity(config: &Config, address: &str, offset: usize, limit: usize) -> Result<(Vec<TxRecord>, usize)> {
+  let t = read_trees(config)?;
+  let mut p = b"w|".to_vec();
+  p.extend_from_slice(address.as_bytes());
+  p.push(b'|');
+  records_from(&t, &p, offset, limit)
+}
+
 pub fn dalk_tx(config: &Config, txid: &str) -> Result<Option<TxRecord>> {
   let t = read_trees(config)?;
   Ok(t.get(T_TX, txid.as_bytes())?.map(|r| serde_json::from_slice(&r)).transpose()?)
@@ -1674,6 +1710,11 @@ mod tests {
     let (h, circ) = holders_of(&t, (6474082, 35)).unwrap();
     assert_eq!((h[0].0.as_str(), h.len(), circ), ("DAAAA", 1, 16));
     assert!(t.get(T_PARCEL, format!("{call}:1").as_bytes()).unwrap().is_none());
+    // per-address history: the claimer has the claim and the spend, the receiver the spend
+    assert_eq!(count_prefix(&t.t[T_IDX as usize], b"w|DKbD8jBVQ8Q7hSQBzNrhm3zt5nNTanFAWB|").unwrap(), 2);
+    assert_eq!(count_prefix(&t.t[T_IDX as usize], b"w|DAAAA|").unwrap(), 1);
+    let sent: TxRecord = serde_json::from_slice(&t.get(T_TX, spend.as_bytes()).unwrap().unwrap()).unwrap();
+    assert_eq!(sent.parcels_from, vec!["DKbD8jBVQ8Q7hSQBzNrhm3zt5nNTanFAWB".to_string()]);
     // undo block 3: the parcel is back on the claim output
     undo_block(&t, 6474091, &st).unwrap();
     let (h, _) = holders_of(&t, (6474082, 35)).unwrap();
