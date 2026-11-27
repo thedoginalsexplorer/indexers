@@ -66,6 +66,9 @@ pub struct CallEnv {
   pub value: u64,
   pub sender: Option<[u8; 20]>,
   pub incoming: Vec<(Id, u128)>,
+  /// `alkane_caller_*` of the top-level frame: `0:0`, except a print's birth (§20), where it is the
+  /// program the print is born from.
+  pub caller: Id,
 }
 
 /// What a call did.
@@ -617,7 +620,7 @@ pub fn execute(engine: &Engine, view: Rc<dyn StateView>, env: &CallEnv) -> CallR
   let frame = Frame {
     shared: shared.clone(),
     myself: env.target,
-    caller: (0, 0),
+    caller: env.caller,
     depth: 0,
     tx: env.tx,
     value: env.value,
@@ -708,6 +711,7 @@ mod tests {
           .as_array()
           .map(|a| a.iter().map(|x| ((x["token_block"].as_u64().unwrap(), x["token_tx"].as_u64().unwrap() as u32), x["amount"].as_str().unwrap().parse().unwrap())).collect())
           .unwrap_or_default(),
+        caller: (0, 0),
       };
       let r = execute(&engine, Rc::new(m), &env);
       let e = &c["expect"];
@@ -755,7 +759,7 @@ mod tests {
     assert_eq!(sender.map(hex::encode).as_deref(), Some("9dabb48cc18082a37ff23d46f891f5f9256d8d12"));
     let mut m = Mem::default();
     m.code.insert((6474082, 35), Rc::new(code));
-    let env = CallEnv { height: 6474090, tx: 15, time: 1795725477, target: (6474082, 35), fuel: 200_000, calldata: calldata(&[77, 1]), value: 16_000_000, sender, incoming: vec![] };
+    let env = CallEnv { height: 6474090, tx: 15, time: 1795725477, target: (6474082, 35), fuel: 200_000, calldata: calldata(&[77, 1]), value: 16_000_000, sender, incoming: vec![], caller: (0, 0) };
     let r = execute(&engine(), Rc::new(m), &env);
     assert!(r.ok, "{:?}", r.error);
     assert_eq!(r.outgoing, vec![((6474082, 35), 1, 16)]);

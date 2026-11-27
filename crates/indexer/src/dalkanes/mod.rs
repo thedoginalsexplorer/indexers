@@ -36,8 +36,9 @@ pub const ACTIVATION: u64 = 6_466_500;
 const STATE_KEY: &[u8] = b"dalk_state_v1";
 /// The rules this index was built with. Raising it clears the Dalkanes trees and replays from
 /// activation (about a minute): 2 = spec v0.4 edge-case pass (strict call forms, the pointer as a
-/// deposit, print births, 2026-11-26).
-const RULES: u64 = 2;
+/// deposit, print births, 2026-11-26); 3 = deployers, project cards (§22), the Proof gate and
+/// collection keys (§20), 2026-11-27.
+const RULES: u64 = 3;
 const RULES_KEY: &[u8] = b"dalk_rules";
 /// Undo records and block hashes kept for reorgs.
 const KEEP: u64 = 200;
@@ -51,6 +52,13 @@ const CANON: &[(&str, &str, &str)] = &[
   ("9f0b242421ddac33991e66e6fca4242b6a356c602d7e61c40baec65b55664194", "ember", "Ember"),
   ("43a9ebb3a709a6622d15df9328670aea26ffb4c30a9f65fe8e78848fa142183c", "proof", "Proof"),
   ("3cba30282ed8344d15416e980c997cb8197d3d587972ea9c3df93a261ae89bf0", "shibkane", "Shibkane"),
+  // 2026-11-26 builds with the collection views (§20, §21) and Kibble (§18)
+  ("7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694", "proof", "Proof"),
+  ("9e9bfc0422676b8d7c76597fb08a8645c90ab15ecd378e32f927cf54084cf345", "shibkane", "Shibkane"),
+  ("ee4c6e7ba6096c1ed5908485135a107f793f8295c2baa0c6e4734a8c9e16a3dd", "kibble", "Kibble"),
+  // builds with baked ids, as deployed on mainnet (Collar: Howl, Ash, Vigil; Bone: Howl)
+  ("66c3610d07e8f2fee6db975f52fe41c74bae826847cbc446146ae42334b315c0", "collar", "Collar"),
+  ("cbb467a319b130e53724de61aba4eb32f2d33ebe2d28b4fcf3a182f79f8d808e", "bone", "Bone"),
   ("38f37f99d4cd20529ef865daf5bef3fb2c44e977f9b0c8cb623b5aee6b0236ab", "amm", "Ðalkanes AMM template"),
   ("6cabfb3380a98a4b4767b8d83d0d32374fbea3e651540e2fcbf13a6e236b258c", "freemint", "Free-mint template"),
 ];
@@ -87,6 +95,9 @@ pub struct DeployMeta {
   /// For a print (§20): the inscribed program it was born from.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub program: Option<String>,
+  /// The P2PKH address of the reveal key (§22.2); none for a print.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub deployer: Option<String>,
 }
 
 /// A call's receipt (§9).
@@ -435,6 +446,138 @@ fn addr_key(addr: &str, outpoint: &[u8]) -> Vec<u8> {
   k
 }
 
+/// Prints a Proof collection may bear (§20).
+const PROOF_CAP: u64 = 420;
+
+fn u64_le(v: &[u8]) -> u64 {
+  let mut b = [0u8; 8];
+  let n = v.len().min(8);
+  b[..n].copy_from_slice(&v[..n]);
+  u64::from_le_bytes(b)
+}
+
+/// The key that signed a reveal (§22.2): the redeem script, the last push of input 0's scriptSig,
+/// starts with `<pubkey> OP_CHECKSIGVERIFY`.
+fn reveal_signer(tx: &RpcTx) -> Option<[u8; 20]> {
+  let ss = hex::decode(&tx.vin.first()?.script_sig.as_ref()?.hex).ok()?;
+  let redeem = script_pushes(&ss)?.pop()?;
+  let first = script_pushes_prefix(&redeem)?;
+  ((first.0.len() == 33 || first.0.len() == 65) && redeem.get(first.1) == Some(&0xad)).then(|| sig::hash160(&first.0))
+}
+
+/// Every push of a script made only of pushes.
+fn script_pushes(s: &[u8]) -> Option<Vec<Vec<u8>>> {
+  let mut out = Vec::new();
+  let mut i = 0;
+  while i < s.len() {
+    let (p, next) = push_at(s, i)?;
+    out.push(p);
+    i = next;
+  }
+  Some(out)
+}
+
+/// The first push of a script and where the next opcode starts.
+fn script_pushes_prefix(s: &[u8]) -> Option<(Vec<u8>, usize)> {
+  push_at(s, 0)
+}
+
+fn push_at(s: &[u8], i: usize) -> Option<(Vec<u8>, usize)> {
+  let op = *s.get(i)?;
+  let (len, hdr) = match op {
+    0x00..=0x4b => (op as usize, 1),
+    0x4c => (*s.get(i + 1)? as usize, 2),
+    0x4d => (u16::from_le_bytes([*s.get(i + 1)?, *s.get(i + 2)?]) as usize, 3),
+    0x51..=0x60 => return Some((vec![op - 0x50], i + 1)),
+    _ => return None,
+  };
+  Some((s.get(i + hdr..i + hdr + len)?.to_vec(), i + hdr + len))
+}
+
+/// A project card (§22.1), as stored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectCard {
+  pub dalkane: String,
+  pub image: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub name: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub description: Option<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub links: Vec<CardLink>,
+  /// The card's own inscription, and where it was revealed.
+  #[serde(default)]
+  pub inscription_id: String,
+  #[serde(default)]
+  pub height: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CardLink {
+  pub label: String,
+  pub url: String,
+}
+
+/// Parses a card body under §22.1 and schemas/project-card.schema.json (no other fields).
+pub fn parse_card(body: &[u8]) -> Option<ProjectCard> {
+  if body.len() > 2048 {
+    return None;
+  }
+  let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+  let o = v.as_object()?;
+  if o.keys().any(|k| !matches!(k.as_str(), "dalkane" | "image" | "name" | "description" | "links")) {
+    return None;
+  }
+  let dalkane = o.get("dalkane")?.as_str()?;
+  parse_id(dalkane)?;
+  if !dalkane.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+    return None;
+  }
+  let image = o.get("image")?.as_str()?;
+  let (txid, idx) = image.split_once('i')?;
+  if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) || idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+    return None;
+  }
+  let text = |k: &str, max: usize| -> Option<Option<String>> {
+    match o.get(k) {
+      None => Some(None),
+      Some(v) => {
+        let s = v.as_str()?;
+        (!s.is_empty() && s.chars().count() <= max).then(|| Some(s.to_string()))
+      }
+    }
+  };
+  let name = text("name", 64)?;
+  let description = text("description", 280)?;
+  let mut links = Vec::new();
+  if let Some(l) = o.get("links") {
+    let arr = l.as_array()?;
+    if arr.len() > 4 {
+      return None;
+    }
+    for x in arr {
+      let xo = x.as_object()?;
+      if xo.keys().any(|k| k != "label" && k != "url") {
+        return None;
+      }
+      let label = xo.get("label")?.as_str()?;
+      let url = xo.get("url")?.as_str()?;
+      let ok_url = (url.starts_with("http://") || url.starts_with("https://")) && url.len() >= 8 && url.len() <= 200 && !url.chars().any(char::is_whitespace);
+      if label.is_empty() || label.chars().count() > 32 || !ok_url {
+        return None;
+      }
+      links.push(CardLink { label: label.into(), url: url.into() });
+    }
+  }
+  Some(ProjectCard { dalkane: dalkane.into(), image: format!("{}i{idx}", txid.to_ascii_lowercase()), name, description, links, ..Default::default() })
+}
+
+fn card_key(id: Id) -> Vec<u8> {
+  let mut k = b"card|".to_vec();
+  k.extend_from_slice(&id_key(id));
+  k
+}
+
 /// What a transaction's message says to do with the parcels its inputs carry (§16.2).
 pub(crate) enum Routing<'a> {
   /// No `0xD1` output, or a version `0x01` call: everything to the first output that can hold it.
@@ -553,6 +696,27 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("print birth refused: this transaction already has an id".into()), ..Default::default() });
     return None;
   }
+  let proof = birth && matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof", _)));
+  if proof {
+    // §20: a Proof collection stops at 420, one pull per block and one per verified sender. Refused
+    // before execution: no fuel, no new id, and the block and the address are not used up.
+    let count = ctx.view.storage(target, &[0x10]).map(|v| u64_le(&v)).unwrap_or(0);
+    let last = ctx.view.storage(target, &[0x14]).map(|v| u64_le(&v));
+    let pulled = sender.is_some_and(|s| ctx.view.storage(target, &[&[0x15u8][..], &s[..]].concat()).is_some());
+    let refused = if count >= PROOF_CAP {
+      Some("the collection is full")
+    } else if last == Some(ctx.height) {
+      Some("this block already pulled")
+    } else if pulled {
+      Some("this address already pulled")
+    } else {
+      None
+    };
+    if let Some(why) = refused {
+      rec.receipt = Some(Receipt { target: fmt_id(target), error: Some(why.into()), ..Default::default() });
+      return None;
+    }
+  }
   if birth {
     ctx.view.deploys.borrow_mut().insert(born, code.clone());
   }
@@ -567,6 +731,7 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     value,
     sender,
     incoming: c.incoming.clone(),
+    caller: if birth { target } else { (0, 0) },
   };
   let view: Rc<dyn StateView> = ctx.view.clone();
   let mut r = vm::execute(&ENGINE, view, &env);
@@ -596,6 +761,23 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
   }
   if birth {
     ctx.births.insert(born, target);
+    // §20: the birth records the print on the program (the program, running as the print, cannot):
+    // the count, the slot, and the print's index; a Proof also its block and its sender
+    let count = ctx.view.storage(target, &[0x10]).map(|v| u64_le(&v)).unwrap_or(0);
+    let mut s = ctx.view.store.borrow_mut();
+    let mut slot = vec![0x11];
+    slot.extend_from_slice(&(count as u32).to_le_bytes());
+    let mut child = born.0.to_le_bytes().to_vec();
+    child.extend_from_slice(&(born.1 as u64).to_le_bytes());
+    s.insert((target, vec![0x10]), (count + 1).to_le_bytes().to_vec());
+    s.insert((target, slot), child);
+    s.insert((born, vec![0x13]), count.to_le_bytes().to_vec());
+    if proof {
+      s.insert((target, vec![0x14]), ctx.height.to_le_bytes().to_vec());
+      if let Some(snd) = sender {
+        s.insert((target, [&[0x15u8][..], &snd[..]].concat()), Vec::new());
+      }
+    }
   }
   {
     let mut s = ctx.view.store.borrow_mut();
@@ -611,8 +793,13 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
 }
 
 /// The deploys block `height` completes: tx index -> (inscription id, content type, code).
-fn deploys_of(t: &Trees, height: u64) -> Result<BTreeMap<u32, (String, String, Vec<u8>)>> {
+/// Card candidates of block `height`, in reveal order: tx index, inscription id, the card.
+type Cards = Vec<(u32, String, ProjectCard)>;
+
+fn deploys_of(t: &Trees, height: u64) -> Result<(BTreeMap<u32, (String, String, Vec<u8>)>, Cards, std::collections::HashSet<String>)> {
   let mut out = BTreeMap::new();
+  let mut cards = Vec::new();
+  let mut ids = std::collections::HashSet::new();
   let mut rows = Vec::new();
   t.seq.for_each_prefix(height.to_be_bytes(), |k, v| {
     let e: SeqEntry = bincode::deserialize(v).context("decode seq entry")?;
@@ -620,16 +807,22 @@ fn deploys_of(t: &Trees, height: u64) -> Result<BTreeMap<u32, (String, String, V
     Ok(true)
   })?;
   for (i, id) in rows {
+    ids.insert(id.clone());
+    let Some(raw) = t.content.get(id.as_bytes())? else { continue };
+    let c = decode_inscription_content(raw.as_ref())?;
+    if c.content_type.to_ascii_lowercase().starts_with("application/json") {
+      if let Some(card) = parse_card(&c.body) {
+        cards.push((i, id.clone(), card));
+      }
+    }
     if out.contains_key(&i) {
       continue;
     }
-    let Some(raw) = t.content.get(id.as_bytes())? else { continue };
-    let c = decode_inscription_content(raw.as_ref())?;
     if let Some(code) = wire::deploy_code(&c.content_type, &c.body) {
       out.insert(i, (id, c.content_type, code));
     }
   }
-  Ok(out)
+  Ok((out, cards, ids))
 }
 
 /// Transactions that carry a `0xD1` call, whose raw bytes the sender check needs.
@@ -654,7 +847,7 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
   let mut w = Writes::new(t);
   let mut view = BlockView::open(db, height)?;
   // 1. deploys, in reveal order (§6.1)
-  let deploys = deploys_of(t, height)?;
+  let (deploys, cards, block_ids) = deploys_of(t, height)?;
   for (&i, (insc, ct, code)) in &deploys {
     let id = (height, i);
     let hash = hex::encode(Sha256::digest(code));
@@ -669,6 +862,7 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
       code_len: code.len(),
       time,
       program: None,
+      deployer: block.tx.get(i as usize).and_then(reveal_signer).as_ref().map(p2pkh_address),
     };
     w.put(T_CODE, id_key(id).to_vec(), Some(serde_json::to_vec(&meta)?));
     w.put(T_WASM, id_key(id).to_vec(), Some(code.clone()));
@@ -763,7 +957,7 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
       let program = ctx.births.get(&pid).copied().context("born print without a program")?;
       let pm: DeployMeta = serde_json::from_slice(&w.get(T_CODE, &id_key(program))?.context("print program metadata")?)?;
       let code = w.get(T_WASM, &id_key(program))?.context("print program code")?;
-      let meta = DeployMeta { id: born, height, tx_index: i, txid: tx.txid.clone(), time, program: Some(pm.id.clone()), ..pm };
+      let meta = DeployMeta { id: born, height, tx_index: i, txid: tx.txid.clone(), time, program: Some(pm.id.clone()), deployer: None, ..pm };
       w.put(T_CODE, id_key(pid).to_vec(), Some(serde_json::to_vec(&meta)?));
       w.put(T_WASM, id_key(pid).to_vec(), Some(code));
       let mut dk = b"d|".to_vec();
@@ -833,7 +1027,28 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
     w.put(T_TX, tx.txid.clone().into_bytes(), Some(serde_json::to_vec(&rec)?));
     n_tx += 1;
   }
-  // 3. the block's storage and ledger writes (§8: zero balances are deleted)
+  // 3. project cards (§22): from the contract's reveal key, naming an image of an earlier block;
+  // a later card from that key replaces the stored one
+  for (i, insc, mut card) in cards {
+    let Some(tx) = block.tx.get(i as usize) else { continue };
+    let (Some(id), Some(signer)) = (parse_id(&card.dalkane), reveal_signer(tx)) else { continue };
+    let Some(raw) = w.get(T_CODE, &id_key(id))? else { continue };
+    let meta: DeployMeta = serde_json::from_slice(&raw)?;
+    if meta.program.is_some() || meta.deployer.as_deref() != Some(p2pkh_address(&signer).as_str()) {
+      continue;
+    }
+    if block_ids.contains(&card.image) {
+      continue;
+    }
+    let Some(img) = t.content.get(card.image.as_bytes())? else { continue };
+    if !decode_inscription_content(img.as_ref())?.content_type.to_ascii_lowercase().starts_with("image/") {
+      continue;
+    }
+    card.inscription_id = insc;
+    card.height = height;
+    w.put(T_IDX, card_key(id), Some(serde_json::to_vec(&card)?));
+  }
+  // 4. the block's storage and ledger writes (§8: zero balances are deleted)
   for ((id, key), v) in view.store.borrow().iter() {
     w.put(T_STORAGE, storage_key(*id, key), Some(v.clone()));
   }
@@ -970,7 +1185,9 @@ pub fn dalk_status(config: &Config) -> Result<DalkStatus> {
     Ok(true)
   })?;
   let height = st.next_height.saturating_sub(1);
-  Ok(DalkStatus { activation: ACTIVATION, height, indexed, caught_up: height + 1 >= indexed, contracts, transactions })
+  // caught up = every block the main index has is read here too (wallets rely on it: until then a
+  // parcel on an output of a newer block is unknown)
+  Ok(DalkStatus { activation: ACTIVATION, height, indexed, caught_up: height >= indexed, contracts, transactions })
 }
 
 /// Committed state, for views run by the API.
@@ -1063,6 +1280,8 @@ pub struct ContractSummary {
   pub calls: usize,
   pub holders: usize,
   pub circulating: String,
+  /// The project card (§22), if its deployer inscribed one.
+  pub card: Option<ProjectCard>,
 }
 
 fn holders_of(t: &Trees, id: Id) -> Result<(Vec<(String, u128, usize)>, u128)> {
@@ -1108,6 +1327,7 @@ fn summary(config: &Config, t: &Trees, meta: DeployMeta, height: u64) -> Result<
     calls,
     holders: holders.len(),
     circulating: circ.to_string(),
+    card: t.get(T_IDX, &card_key(id))?.map(|v| serde_json::from_slice(&v)).transpose()?,
     meta,
   })
 }
@@ -1140,6 +1360,9 @@ pub struct ContractDetail {
   pub top_holders: Vec<Holder>,
   pub sheet: Vec<Amount>,
   pub storage_keys: usize,
+  /// A Proof or Shibkane collection (§20): the tag, the count and the first 48 prints on a program;
+  /// the parent and the index on a print.
+  pub orbital: Option<serde_json::Value>,
 }
 
 pub fn dalk_contract(config: &Config, id: Id) -> Result<Option<ContractDetail>> {
@@ -1159,11 +1382,33 @@ pub fn dalk_contract(config: &Config, id: Id) -> Result<Option<ContractDetail>> 
     Ok(true)
   })?;
   let storage_keys = count_prefix(&t.t[T_STORAGE as usize], &me)?;
+  let st = |key: &[u8]| -> Result<Option<Vec<u8>>> { t.get(T_STORAGE, &storage_key(id, key)) };
+  let orbital = if matches!(summary.kind.as_deref(), Some("proof" | "shibkane")) {
+    if let Some(parent) = summary.meta.program.clone() {
+      Some(serde_json::json!({ "standard": "dalkane-orbital/1", "parent": parent, "index": st(&[0x13])?.map(|v| u64_le(&v)) }))
+    } else {
+      let count = st(&[0x10])?.map(|v| u64_le(&v)).unwrap_or(0);
+      let mut prints = Vec::new();
+      for n in 0..count.min(48) {
+        let mut k = vec![0x11];
+        k.extend_from_slice(&(n as u32).to_le_bytes());
+        if let Some(v) = st(&k)? {
+          if v.len() >= 16 {
+            prints.push(fmt_id((u64_le(&v[..8]), u64_le(&v[8..16]) as u32)));
+          }
+        }
+      }
+      Some(serde_json::json!({ "standard": "dalkane-orbital/1", "count": count, "prints": prints }))
+    }
+  } else {
+    None
+  };
   Ok(Some(ContractDetail {
     summary,
     top_holders: holders.into_iter().take(100).map(|(a, n, o)| Holder { address: a, amount: n.to_string(), outputs: o }).collect(),
     sheet,
     storage_keys,
+    orbital,
   }))
 }
 
@@ -1310,6 +1555,40 @@ pub fn dalk_storage(config: &Config, id: Id, limit: usize) -> Result<Vec<Storage
     Ok(out.len() < limit)
   })?;
   Ok(out)
+}
+
+/// The parcels on each of `outpoints` ("txid:vout"), in order: (alkane id, amount), empty for none.
+pub(crate) fn parcels_on(db: &store::Db, outpoints: &[&str]) -> Result<Vec<Vec<(String, String)>>> {
+  let tree = db.open_tree("dalk_parcel")?;
+  let got = tree.multi_get(outpoints)?;
+  got
+    .into_iter()
+    .map(|hit| match hit {
+      Some(raw) => Ok(serde_json::from_slice::<ParcelRec>(raw.as_ref())?.items.into_iter().filter(|(_, a)| a != "0").collect()),
+      None => Ok(Vec::new()),
+    })
+    .collect()
+}
+
+/// A dry run of a top-level call against committed state at the next block: what a wallet asks
+/// before it signs. `sender` is the verified sender's 20-byte hash, `value` the koinu the carrier
+/// would burn. Nothing is written.
+pub fn dalk_simulate(config: &Config, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>) -> Result<vm::CallResult> {
+  let db = ii::db_of(config)?;
+  let meta = load_state(&db.open_tree("meta")?)?;
+  let view: Rc<dyn StateView> = Rc::new(DbView { wasm: db.open_tree("dalk_wasm")?, storage: db.open_tree("dalk_storage")?, ledger: db.open_tree("dalk_ledger")? });
+  let env = vm::CallEnv {
+    height: meta.next_height,
+    tx: 1,
+    time: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    target,
+    fuel: vm::MAX_FUEL,
+    calldata: vm::calldata(inputs),
+    value,
+    sender,
+    ..Default::default()
+  };
+  Ok(vm::execute(&ENGINE, view, &env))
 }
 
 pub fn dalk_code(config: &Config, id: Id) -> Result<Option<Vec<u8>>> {
@@ -1565,10 +1844,11 @@ mod tests {
     let meta: DeployMeta = serde_json::from_slice(&t.get(T_CODE, &id_key((h0, 1))).unwrap().unwrap()).unwrap();
     assert_eq!(canon_of(&meta.code_hash).map(|c| c.0), Some("proof"));
 
-    let key = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let k1 = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let k2 = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
     let p2pkh = hex::decode("76a914000000000000000000000000000000000000000088ac").unwrap();
-    let pull = |h: u64, target: Id, st: &mut State| -> TxRecord {
-      let raw = signed_call(&key, target, &[77, 1], &p2pkh);
+    let pull = |h: u64, target: Id, key: &secp256k1::SecretKey, st: &mut State| -> TxRecord {
+      let raw = signed_call(key, target, &[77, 1], &p2pkh);
       let txid = format!("{:064x}", h);
       let mut txs = filler(1, h);
       txs.push(call_tx(&txid, &raw));
@@ -1578,31 +1858,59 @@ mod tests {
       index_block(&db, &t, h, &block(h, txs), &rawmap, st).unwrap();
       serde_json::from_slice(&t.get(T_TX, txid.as_bytes()).unwrap().unwrap()).unwrap()
     };
-    // first pull: a print is born at (h0+1, 1)
-    let r = pull(h0 + 1, (h0, 1), &mut st);
+    let program = (h0, 1);
+    let slot = |n: u32| t.get(T_STORAGE, &storage_key(program, &[&[0x11u8][..], &n.to_le_bytes()[..]].concat())).unwrap();
+    // first pull: a print is born at (h0+1, 1), and the program records it at index 0
+    let r = pull(h0 + 1, program, &k1, &mut st);
     let rc = r.receipt.unwrap();
     assert!(rc.ok, "{:?}", rc.error);
     assert!(r.sender.is_some());
     let born = fmt_id((h0 + 1, 1));
     assert_eq!(rc.born.as_deref(), Some(born.as_str()));
-    assert_eq!(r.parcels_out.len(), 1);
     assert_eq!((r.parcels_out[0].id.as_str(), r.parcels_out[0].amount.as_str(), r.parcels_out[0].vout), (born.as_str(), "1", 1));
     let pm: DeployMeta = serde_json::from_slice(&t.get(T_CODE, &id_key((h0 + 1, 1))).unwrap().unwrap()).unwrap();
-    assert_eq!(pm.program.as_deref(), Some(fmt_id((h0, 1)).as_str()));
-    // the pull's storage belongs to the print, not the program
-    assert_eq!(count_prefix(&t.t[T_STORAGE as usize], &id_key((h0, 1))).unwrap(), 0);
-    assert!(count_prefix(&t.t[T_STORAGE as usize], &id_key((h0 + 1, 1))).unwrap() > 0);
-    // a later 77 on the program births another print
-    let r = pull(h0 + 2, (h0, 1), &mut st);
-    assert_eq!(r.receipt.unwrap().born.as_deref(), Some(fmt_id((h0 + 2, 1)).as_str()));
-    // 77 on a print births nothing, and the print was already pulled
-    let r = pull(h0 + 3, (h0 + 1, 1), &mut st);
+    assert_eq!(pm.program.as_deref(), Some(fmt_id(program).as_str()));
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(1));
+    let mut child = (h0 + 1).to_le_bytes().to_vec();
+    child.extend_from_slice(&1u64.to_le_bytes());
+    assert_eq!(slot(0), Some(child));
+    assert_eq!(t.get(T_STORAGE, &storage_key((h0 + 1, 1), &[0x13])).unwrap().map(|v| u64_le(&v)), Some(0));
+    // the program, running as the print, wrote its parent (the caller) under 0x12
+    let mut parent = h0.to_le_bytes().to_vec();
+    parent.extend_from_slice(&1u64.to_le_bytes());
+    assert_eq!(t.get(T_STORAGE, &storage_key((h0 + 1, 1), &[0x12])).unwrap(), Some(parent));
+    // the same address again: refused before execution, no id
+    let r = pull(h0 + 2, program, &k1, &mut st);
+    let rc = r.receipt.unwrap();
+    assert_eq!((rc.ok, rc.fuel_used, rc.error.as_deref(), rc.born.is_none()), (false, 0, Some("this address already pulled"), true));
+    // another address births the second print, index 1
+    let r = pull(h0 + 3, program, &k2, &mut st);
+    assert_eq!(r.receipt.unwrap().born.as_deref(), Some(fmt_id((h0 + 3, 1)).as_str()));
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(2));
+    assert!(slot(1).is_some());
+    // 77 on a print births nothing
+    let r = pull(h0 + 4, (h0 + 1, 1), &k2, &mut st);
     let rc = r.receipt.unwrap();
     assert!(!rc.ok && rc.born.is_none(), "{rc:?}");
+    // a reorg takes the second print back, slot and all
+    undo_block(&t, h0 + 4, &st).unwrap();
+    undo_block(&t, h0 + 3, &st).unwrap();
     assert!(t.get(T_CODE, &id_key((h0 + 3, 1))).unwrap().is_none());
-    // a reorg takes the print back
-    undo_block(&t, h0 + 2, &st).unwrap();
-    assert!(t.get(T_CODE, &id_key((h0 + 2, 1))).unwrap().is_none());
+    assert!(slot(1).is_none());
+    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(1));
+  }
+
+  /// §22.1: the card body, under the schema.
+  #[test]
+  fn project_card_rules() {
+    let img = format!("{}i0", "AB".repeat(32));
+    let ok = format!(r#"{{"dalkane":"6474606:65","image":"{img}","name":"Kibble","links":[{{"label":"site","url":"https://doginals.store"}}]}}"#);
+    let c = parse_card(ok.as_bytes()).unwrap();
+    assert_eq!(c.image, format!("{}i0", "ab".repeat(32)));
+    assert!(parse_card(format!(r#"{{"dalkane":"1:2","image":"{img}","extra":1}}"#).as_bytes()).is_none());
+    assert!(parse_card(br#"{"dalkane":"1:2"}"#).is_none());
+    assert!(parse_card(format!(r#"{{"dalkane":"1:2","image":"{img}","links":[{{"label":"x","url":"ftp://a.b"}}]}}"#).as_bytes()).is_none());
+    assert!(parse_card(format!(r#"{{"dalkane":"1:2","image":"{img}","name":""}}"#).as_bytes()).is_none());
   }
 }
 

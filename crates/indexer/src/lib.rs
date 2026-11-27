@@ -2868,8 +2868,10 @@ pub fn list_spendable_utxos_for_address(config: &Config, address: &str) -> Resul
     let keys: Vec<&str> = chunk.iter().map(|(outpoint, _)| outpoint.as_str()).collect();
     let inscribed = inscriptions_by_outpoint.multi_get(&keys)?;
     let with_dunes = dunes::holding_outpoints(&db, &keys)?;
-    for (((outpoint, sats), hit), has_dunes) in chunk.iter().zip(inscribed).zip(with_dunes) {
-      if hit.is_none() && !has_dunes {
+    // Ðalkanes parcels ride outputs too: spending one as plain DOGE would move them
+    let parcels = dalkanes::parcels_on(&db, &keys)?;
+    for ((((outpoint, sats), hit), has_dunes), parcel) in chunk.iter().zip(inscribed).zip(with_dunes).zip(parcels) {
+      if hit.is_none() && !has_dunes && parcel.is_empty() {
         utxos.push((outpoint.clone(), *sats));
       }
     }
@@ -2888,6 +2890,13 @@ pub struct UnspentInscription {
 /// A Dune balance on an unspent output, as a raw integer string.
 #[derive(Debug, Serialize, Clone)]
 pub struct UnspentDune {
+  pub id: String,
+  pub amount: String,
+}
+
+/// Ðalkanes units on an unspent output (a parcel, spec §16): `id` is the alkane's block:tx.
+#[derive(Debug, Serialize, Clone)]
+pub struct UnspentDalkane {
   pub id: String,
   pub amount: String,
 }
@@ -2915,6 +2924,9 @@ pub struct Unspent {
   pub inscriptions: Vec<UnspentInscription>,
   pub dunes: Vec<UnspentDune>,
   pub drc20: Vec<UnspentDrc20>,
+  /// Ðalkanes parcels (spec §16). Spending the output without a Ðalkanes message moves them to the
+  /// spending transaction's first non-OP_RETURN output.
+  pub dalkanes: Vec<UnspentDalkane>,
 }
 
 /// Every unspent output of `address`, each with the inscriptions, Dunes and
@@ -2948,6 +2960,7 @@ pub fn list_unspent_for_address(config: &Config, address: &str) -> Result<Vec<Un
   for chunk in candidates.chunks(4096) {
     let keys: Vec<&str> = chunk.iter().map(|(outpoint, _)| outpoint.as_str()).collect();
     let inscribed = inscriptions_by_outpoint.multi_get(&keys)?;
+    let mut parcels = dalkanes::parcels_on(&db, &keys)?.into_iter();
     // Which outputs hold dunes, then what each of those holds.
     let with_dunes = dunes::holding_outpoints(&db, &keys)?;
     let mut dunes: HashMap<&str, Vec<UnspentDune>> = HashMap::new();
@@ -2994,14 +3007,16 @@ pub fn list_unspent_for_address(config: &Config, address: &str) -> Result<Vec<Un
         }
       }
       let dunes_here = dunes.remove(outpoint.as_str()).unwrap_or_default();
+      let dalk: Vec<UnspentDalkane> = parcels.next().unwrap_or_default().into_iter().map(|(id, amount)| UnspentDalkane { id, amount }).collect();
       out.push(Unspent {
         txid: txid.to_string(),
         vout,
         satoshis: *sats,
-        spendable: entries.is_empty() && dunes_here.is_empty(),
+        spendable: entries.is_empty() && dunes_here.is_empty() && dalk.is_empty(),
         inscriptions: entries.into_iter().map(|(offset, id)| UnspentInscription { id, offset }).collect(),
         dunes: dunes_here,
         drc20,
+        dalkanes: dalk,
       });
     }
   }
