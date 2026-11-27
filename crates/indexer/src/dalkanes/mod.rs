@@ -775,7 +775,8 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     if proof {
       s.insert((target, vec![0x14]), ctx.height.to_le_bytes().to_vec());
       if let Some(snd) = sender {
-        s.insert((target, [&[0x15u8][..], &snd[..]].concat()), Vec::new());
+        // §20: the stored value is the single byte 0x01 (the gate only checks that the key exists)
+        s.insert((target, [&[0x15u8][..], &snd[..]].concat()), vec![0x01]);
       }
     }
   }
