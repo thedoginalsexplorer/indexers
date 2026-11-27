@@ -50,13 +50,11 @@ const CANON: &[(&str, &str, &str)] = &[
   ("9fa39d1c852c1113f25fbae64cb87ca628f1e151586e3c11db88c51d15548148", "vigil", "Vigil"),
   ("6a0d1a554907a38c1505b25829aeaa6dc600bb69cbf76c793ee1019ca5494f78", "quiet", "Quiet"),
   ("9f0b242421ddac33991e66e6fca4242b6a356c602d7e61c40baec65b55664194", "ember", "Ember"),
-  ("43a9ebb3a709a6622d15df9328670aea26ffb4c30a9f65fe8e78848fa142183c", "proof", "Proof"),
-  ("3cba30282ed8344d15416e980c997cb8197d3d587972ea9c3df93a261ae89bf0", "shibkane", "Shibkane"),
-  // 2026-11-26 builds with the collection views (§20, §21) and Kibble (§18)
+  // §24 (spec 0.4.2, vectors/canonical-builds.json): the three print programs (§20.1). Nothing else is
+  // one: the superseded bodies 43a9ebb3 (Proof), 3cba3028 and 9e9bfc04 (Shibkane) get no label and no gate.
   ("7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694", "proof", "Proof"),
-  ("9e9bfc0422676b8d7c76597fb08a8645c90ab15ecd378e32f927cf54084cf345", "shibkane", "Shibkane"),
-  // Doge Orbital (§23, kind "doge"): same births and gate as Proof. Its canonical hash is added here
-  // once dogex publishes /api/alkanes/doge/build (nothing is inscribed yet).
+  ("b69f0aa9b8cd66335d1c08fa6c86d3af7d6b0def30c8d8688eff6ebefe9c71a4", "shibkane", "Shibkane"),
+  ("aeafccfee33779532d930b86bfbd2fbb0e5519db072dc26e29888e3c4040a4c4", "doge", "Doge Orbital"),
   ("ee4c6e7ba6096c1ed5908485135a107f793f8295c2baa0c6e4734a8c9e16a3dd", "kibble", "Kibble"),
   // builds with baked ids, as deployed on mainnet (Collar: Howl, Ash, Vigil; Bone: Howl)
   ("66c3610d07e8f2fee6db975f52fe41c74bae826847cbc446146ae42334b315c0", "collar", "Collar"),
@@ -460,18 +458,27 @@ fn addr_key(addr: &str, outpoint: &[u8]) -> Vec<u8> {
   k
 }
 
-/// Prints a Proof or Shibkane collection may bear (§20, §21 since spec 1f80b65).
+/// Prints a Proof, Shibkane or Doge Orbital collection may bear (§20.1).
 const PROOF_CAP: u64 = 420;
 
-/// §20: why a Proof pull at `height` from `sender` is refused before execution, if it is: the collection
-/// is full, this block already pulled, or this address already pulled. Shared by the block and the dry run.
+/// The first block where a print program no longer refuses a second pull in the same block (key `0x14`).
+/// This follows jonheaven's 2026-11-27 note: the block lock came from Howl and Kibble and is wrong for a
+/// drop (Bitcoin's Orbital draft lets several children be born in one block). The 420 cap and one pull
+/// per address stay. Blocks below this keep the old rule, so the prints already born (#0–#3) and the
+/// pulls refused in old blocks (e.g. 6475541 tx 31) stay as they are, and nothing replays. Spec 0.4.2
+/// still lists the block lock; this height is ours until the spec names one.
+pub const PRINT_BLOCK_LOCK_END: u64 = 6_475_700;
+
+/// §20.1: why a pull at `height` from `sender` is refused before execution, if it is: the collection
+/// is full, this block already pulled (only below PRINT_BLOCK_LOCK_END), or this address already pulled.
+/// Shared by the block and the dry run.
 fn proof_refusal(view: &dyn StateView, program: Id, height: u64, sender: Option<[u8; 20]>) -> Option<&'static str> {
   let count = view.storage(program, &[0x10]).map(|v| u64_le(&v)).unwrap_or(0);
   let last = view.storage(program, &[0x14]).map(|v| u64_le(&v));
   let pulled = sender.is_some_and(|s| view.storage(program, &[&[0x15u8][..], &s[..]].concat()).is_some());
   if count >= PROOF_CAP {
     Some("the collection is full")
-  } else if last == Some(height) {
+  } else if height < PRINT_BLOCK_LOCK_END && last == Some(height) {
     Some("this block already pulled")
   } else if pulled {
     Some("this address already pulled")
@@ -727,8 +734,8 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("print birth refused: this transaction already has an id".into()), ..Default::default() });
     return None;
   }
-  // §20/§21 (spec 1f80b65): Proof and Shibkane collections share the gate: 420 prints, one pull per
-  // block, one per verified sender
+  // §20.1: Proof, Shibkane and Doge Orbital share the gate: 420 prints and one per verified sender, and
+  // one pull per block only below PRINT_BLOCK_LOCK_END
   let proof = birth && matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof" | "shibkane" | "doge", _)));
   if proof {
     // §20: a Proof collection stops at 420, one pull per block and one per verified sender. Refused
@@ -1643,7 +1650,12 @@ impl StateView for SimView {
     }
   }
   fn storage(&self, id: Id, key: &[u8]) -> Option<Vec<u8>> {
-    self.db.storage(id, key)
+    // Appendix A (spec 0.4.2): the birth runs with the print's storage empty, even if the placeholder
+    // id is already taken in committed state
+    match &self.born {
+      Some((b, _)) if *b == id => None,
+      _ => self.db.storage(id, key),
+    }
   }
   fn ledger(&self, key: &[u8]) -> u128 {
     self.db.ledger(key)
@@ -1716,6 +1728,17 @@ mod tests {
   #[test]
   fn canon_labels() {
     assert_eq!(canon_of("5b9fa2476e0e669aa3126cbdb4c172c29a0685e5bc0e831411e96d7836a5a916").unwrap().1, "Howl");
+    // §24: the print programs, and the superseded bodies that are not
+    assert_eq!(canon_of("7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694").unwrap().0, "proof");
+    assert_eq!(canon_of("b69f0aa9b8cd66335d1c08fa6c86d3af7d6b0def30c8d8688eff6ebefe9c71a4").unwrap().0, "shibkane");
+    assert_eq!(canon_of("aeafccfee33779532d930b86bfbd2fbb0e5519db072dc26e29888e3c4040a4c4").unwrap().0, "doge");
+    for old in [
+      "43a9ebb3a709a6622d15df9328670aea26ffb4c30a9f65fe8e78848fa142183c",
+      "3cba30282ed8344d15416e980c997cb8197d3d587972ea9c3df93a261ae89bf0",
+      "9e9bfc0422676b8d7c76597fb08a8645c90ab15ecd378e32f927cf54084cf345",
+    ] {
+      assert!(canon_of(old).is_none(), "{old}");
+    }
   }
   fn txj(txid: &str, vin: serde_json::Value, vout: serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "txid": txid, "vin": vin, "vout": vout })
@@ -1945,7 +1968,8 @@ mod tests {
     let db = store::Db::temporary().unwrap();
     let t = Trees::open(&db).unwrap();
     let body = hex::decode(include_str!("vectors/proof-deploy.hex").trim()).unwrap();
-    let h0 = 6_480_000u64;
+    // below PRINT_BLOCK_LOCK_END: the original gate, block lock included
+    let h0 = 6_470_000u64;
     let insc = format!("{}i0", "ab".repeat(32));
     t.seq.insert(ii::seq_key(h0, 1), bincode::serialize(&SeqEntry { id: insc.clone(), kinds: 0, time: 0 }).unwrap()).unwrap();
     t.content.insert(insc.as_bytes(), bincode::serialize(&crate::InscriptionContentRecord { content_type: "application/wasm".into(), body, delegate: None }).unwrap()).unwrap();
@@ -2033,10 +2057,10 @@ mod tests {
     assert!(!sim.result.ok && sim.born.is_none());
   }
 
-  /// §21 (spec 1f80b65): a Shibkane collection has Proof's gate: one pull per address and per block,
-  /// refused before execution with no fuel and no id, and the dry run says so too.
+  /// §24 (spec 0.4.2): a superseded Shibkane body (9e9bfc04) is not a print program: no label, no
+  /// birth, and none of the §20.1 refusals.
   #[test]
-  fn shibkane_gate() {
+  fn superseded_shibkane_is_not_a_print_program() {
     let db = store::Db::temporary().unwrap();
     let t = Trees::open(&db).unwrap();
     let body = hex::decode(include_str!("vectors/shibkane-deploy.hex").trim()).unwrap();
@@ -2049,47 +2073,128 @@ mod tests {
     txs.push(txj(&"cd".repeat(32), serde_json::json!([{}]), serde_json::json!([{ "value": 0.001, "n": 0, "scriptPubKey": { "hex": "51" } }])));
     index_block(&db, &t, h0, &block(h0, txs), &HashMap::new(), &st).unwrap();
     let meta: DeployMeta = serde_json::from_slice(&t.get(T_CODE, &id_key((h0, 1))).unwrap().unwrap()).unwrap();
-    assert_eq!(canon_of(&meta.code_hash).map(|c| c.0), Some("shibkane"));
+    assert!(canon_of(&meta.code_hash).is_none());
     let k1 = secp256k1::SecretKey::from_slice(&[11u8; 32]).unwrap();
-    let k2 = secp256k1::SecretKey::from_slice(&[13u8; 32]).unwrap();
     let p2pkh = hex::decode("76a914000000000000000000000000000000000000000088ac").unwrap();
     let program = (h0, 1);
-    let pull = |h: u64, key: &secp256k1::SecretKey, st: &mut State| -> TxRecord {
-      let raw = signed_call(key, program, &[77, 1], &p2pkh);
+    for h in [h0 + 1, h0 + 2] {
+      let raw = signed_call(&k1, program, &[77, 1], &p2pkh);
       let txid = format!("{:064x}", h + 7);
       let mut txs = filler(1, h);
       txs.push(call_tx(&txid, &raw));
       let mut rawmap = HashMap::new();
       rawmap.insert(txid.clone(), raw);
       st.next_height = h + 1;
+      index_block(&db, &t, h, &block(h, txs), &rawmap, &st).unwrap();
+      let r: TxRecord = serde_json::from_slice(&t.get(T_TX, txid.as_bytes()).unwrap().unwrap()).unwrap();
+      let rc = r.receipt.unwrap();
+      assert!(rc.born.is_none(), "{rc:?}");
+      assert!(!matches!(rc.error.as_deref(), Some("this address already pulled" | "this block already pulled" | "the collection is full")), "{rc:?}");
+    }
+    assert!(t.get(T_CODE, &id_key((h0 + 1, 1))).unwrap().is_none());
+    let sim = simulate_at(&db, h0 + 3, 0, program, &[77, 1], 0, None).unwrap();
+    assert!(sim.born.is_none());
+  }
+
+  /// From PRINT_BLOCK_LOCK_END a print program takes several pulls in one block, in transaction order,
+  /// with sequential indexes. Below it the second pull in a block is refused. One per address and the
+  /// dry run follow the same heights.
+  #[test]
+  fn print_block_lock_ends() {
+    let db = store::Db::temporary().unwrap();
+    let t = Trees::open(&db).unwrap();
+    let body = hex::decode(include_str!("vectors/proof-deploy.hex").trim()).unwrap();
+    let end = PRINT_BLOCK_LOCK_END;
+    let h0 = end - 2;
+    let insc = format!("{}i0", "ef".repeat(32));
+    t.seq.insert(ii::seq_key(h0, 1), bincode::serialize(&SeqEntry { id: insc.clone(), kinds: 0, time: 0 }).unwrap()).unwrap();
+    t.content.insert(insc.as_bytes(), bincode::serialize(&crate::InscriptionContentRecord { content_type: "application/wasm".into(), body, delegate: None }).unwrap()).unwrap();
+    let mut st = State { next_height: h0 + 1, ..Default::default() };
+    let mut txs = filler(1, h0);
+    txs.push(txj(&"ef".repeat(32), serde_json::json!([{}]), serde_json::json!([{ "value": 0.001, "n": 0, "scriptPubKey": { "hex": "51" } }])));
+    index_block(&db, &t, h0, &block(h0, txs), &HashMap::new(), &st).unwrap();
+    let program = (h0, 1);
+    let p2pkh = hex::decode("76a914000000000000000000000000000000000000000088ac").unwrap();
+    let key = |b: u8| secp256k1::SecretKey::from_slice(&[b; 32]).unwrap();
+    let h160 = |k: &secp256k1::SecretKey| sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), k).serialize());
+    // one block with a pull from each key, in this order; the receipts in transaction order
+    let block_of = |h: u64, keys: &[secp256k1::SecretKey], st: &mut State| -> Vec<Receipt> {
+      let mut txs = filler(1, h);
+      let mut rawmap = HashMap::new();
+      let mut ids = Vec::new();
+      for (n, k) in keys.iter().enumerate() {
+        let raw = signed_call(k, program, &[77, 1], &p2pkh);
+        let txid = format!("{:064x}", h * 100 + n as u64 + 50);
+        txs.push(call_tx(&txid, &raw));
+        rawmap.insert(txid.clone(), raw);
+        ids.push(txid);
+      }
+      st.next_height = h + 1;
       index_block(&db, &t, h, &block(h, txs), &rawmap, st).unwrap();
-      serde_json::from_slice(&t.get(T_TX, txid.as_bytes()).unwrap().unwrap()).unwrap()
+      ids.iter().map(|id| serde_json::from_slice::<TxRecord>(&t.get(T_TX, id.as_bytes()).unwrap().unwrap()).unwrap().receipt.unwrap()).collect()
     };
-    let r = pull(h0 + 1, &k1, &mut st);
-    let rc = r.receipt.unwrap();
-    assert!(rc.ok, "{:?}", rc.error);
-    assert_eq!(rc.born.as_deref(), Some(fmt_id((h0 + 1, 1)).as_str()));
-    let k1h = sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &k1).serialize());
-    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x14])).unwrap().map(|v| u64_le(&v)), Some(h0 + 1));
-    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[&[0x15u8][..], &k1h[..]].concat())).unwrap(), Some(vec![0x01]));
-    // the same address again: refused before execution, fuel 0, no id (the open collection would have born a second)
-    let r = pull(h0 + 2, &k1, &mut st);
-    let rc = r.receipt.unwrap();
-    assert_eq!((rc.ok, rc.fuel_used, rc.error.as_deref(), rc.born.is_none()), (false, 0, Some("this address already pulled"), true));
-    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(1));
-    // the dry run: refused for k1 and in the block that last pulled; k2 births at the next block
-    let sim = simulate_at(&db, h0 + 3, 0, program, &[77, 1], 0, Some(k1h)).unwrap();
-    assert_eq!((sim.result.ok, sim.result.error.as_deref(), sim.born), (false, Some("this address already pulled"), None));
-    let k2h = sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &k2).serialize());
-    let sim = simulate_at(&db, h0 + 1, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
-    assert_eq!(sim.result.error.as_deref(), Some("this block already pulled"));
-    let sim = simulate_at(&db, h0 + 3, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
+    let count = || t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v));
+    let index_of = |id: Id| t.get(T_STORAGE, &storage_key(id, &[0x13])).unwrap().map(|v| u64_le(&v));
+    // the last locked block: the first pull births, the second is refused before execution
+    let r = block_of(end - 1, &[key(21), key(22)], &mut st);
+    assert_eq!(r[0].born.as_deref(), Some(fmt_id((end - 1, 1)).as_str()), "{:?}", r[0]);
+    assert_eq!((r[1].ok, r[1].fuel_used, r[1].error.as_deref(), r[1].born.is_none()), (false, 0, Some("this block already pulled"), true));
+    assert_eq!(count(), Some(1));
+    // the dry run in that block says the same; from `end` it does not
+    assert_eq!(simulate_at(&db, end - 1, 0, program, &[77, 1], 0, Some(h160(&key(22)))).unwrap().result.error.as_deref(), Some("this block already pulled"));
+    // from `end`: two pulls in one block both birth, indexes 1 and 2, in transaction order
+    let r = block_of(end, &[key(22), key(23)], &mut st);
+    assert_eq!(r[0].born.as_deref(), Some(fmt_id((end, 1)).as_str()), "{:?}", r[0]);
+    assert_eq!(r[1].born.as_deref(), Some(fmt_id((end, 2)).as_str()), "{:?}", r[1]);
+    assert_eq!((index_of((end, 1)), index_of((end, 2))), (Some(1), Some(2)));
+    assert_eq!(count(), Some(3));
+    let slot = |n: u32| t.get(T_STORAGE, &storage_key(program, &[&[0x11u8][..], &n.to_le_bytes()[..]].concat())).unwrap();
+    let mut child = end.to_le_bytes().to_vec();
+    child.extend_from_slice(&2u64.to_le_bytes());
+    assert_eq!(slot(2), Some(child));
+    // a fresh address in the block that just pulled: the dry run births it
+    let sim = simulate_at(&db, end, 0, program, &[77, 1], 0, Some(h160(&key(24)))).unwrap();
     assert!(sim.result.ok, "{:?}", sim.result.error);
-    assert_eq!(sim.born, Some((h0 + 3, 1)));
-    // another address births the second print
-    let r = pull(h0 + 3, &k2, &mut st);
-    assert_eq!(r.receipt.unwrap().born.as_deref(), Some(fmt_id((h0 + 3, 1)).as_str()));
-    assert_eq!(t.get(T_STORAGE, &storage_key(program, &[0x10])).unwrap().map(|v| u64_le(&v)), Some(2));
+    // one per address still holds, in a later block and within one block
+    let r = block_of(end + 1, &[key(23), key(24), key(24)], &mut st);
+    assert_eq!((r[0].ok, r[0].fuel_used, r[0].error.as_deref()), (false, 0, Some("this address already pulled")));
+    assert_eq!(r[1].born.as_deref(), Some(fmt_id((end + 1, 2)).as_str()), "{:?}", r[1]);
+    assert_eq!(r[2].error.as_deref(), Some("this address already pulled"));
+    assert_eq!(count(), Some(4));
+    assert_eq!(simulate_at(&db, end + 2, 0, program, &[77, 1], 0, Some(h160(&key(21)))).unwrap().result.error.as_deref(), Some("this address already pulled"));
+  }
+
+  /// §20.1: the cap and the address hold at every height; the block lock only below PRINT_BLOCK_LOCK_END.
+  #[test]
+  fn print_refusal_rules() {
+    struct V(HashMap<Vec<u8>, Vec<u8>>);
+    impl StateView for V {
+      fn code(&self, _: Id, _: u64, _: u32) -> Option<Rc<Vec<u8>>> {
+        None
+      }
+      fn storage(&self, _: Id, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key).cloned()
+      }
+      fn ledger(&self, _: &[u8]) -> u128 {
+        0
+      }
+    }
+    let p = (1, 1);
+    let s = [7u8; 20];
+    let end = PRINT_BLOCK_LOCK_END;
+    let mut m = HashMap::new();
+    m.insert(vec![0x10], 419u64.to_le_bytes().to_vec());
+    m.insert(vec![0x14], (end - 1).to_le_bytes().to_vec());
+    let v = V(m.clone());
+    assert_eq!(proof_refusal(&v, p, end - 1, Some(s)), Some("this block already pulled"));
+    assert_eq!(proof_refusal(&v, p, end, Some(s)), None);
+    m.insert(vec![0x14], end.to_le_bytes().to_vec());
+    assert_eq!(proof_refusal(&V(m.clone()), p, end, Some(s)), None);
+    m.insert([&[0x15u8][..], &s[..]].concat(), vec![0x01]);
+    assert_eq!(proof_refusal(&V(m.clone()), p, end + 5, Some(s)), Some("this address already pulled"));
+    assert_eq!(proof_refusal(&V(m.clone()), p, end + 5, Some([8u8; 20])), None);
+    m.insert(vec![0x10], 420u64.to_le_bytes().to_vec());
+    assert_eq!(proof_refusal(&V(m.clone()), p, end + 5, Some([8u8; 20])), Some("the collection is full"));
   }
 
   /// §22.1: the card body, under the schema.
