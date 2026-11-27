@@ -82,7 +82,10 @@ pub fn is_d1_output(script: &[u8]) -> bool {
   matches!(first, Some(p) if p.first() == Some(&MAGIC))
 }
 
-/// Version byte and the bytes after it, for forms A, B and C.
+/// Version byte and the bytes after it (§5.1 forms A–C for calls, §16.1 forms A′ and C′ for parcels).
+/// A call in form A is exactly one push and in form C exactly two; form B allows more pushes after
+/// the cellpack. A parcel message allows trailing pushes after A′ or C′, but its version byte must
+/// begin the push that carries the rest (`D1`, `02`, `rest` as three pushes does not decode).
 fn version_and_body(script: &[u8]) -> Option<(u8, Vec<u8>)> {
   let (ps, truncated, _) = pushes(script);
   if truncated {
@@ -93,16 +96,27 @@ fn version_and_body(script: &[u8]) -> Option<(u8, Vec<u8>)> {
     return None;
   }
   if p0.len() > 1 {
-    // form A: D1 ver ‖ body
-    return Some((p0[1], p0[2..].to_vec()));
+    // form A / A′: D1 ver ‖ body
+    let ver = p0[1];
+    if ver == 0x01 && ps.len() != 1 {
+      return None;
+    }
+    return Some((ver, p0[2..].to_vec()));
   }
   let p1 = ps.get(1)?;
   if p1.len() == 1 {
-    // form B: D1, ver, body
-    return Some((p1[0], ps.get(2)?.clone()));
+    // form B: D1, 01, cellpack (calls only)
+    if p1[0] != 0x01 {
+      return None;
+    }
+    return Some((0x01, ps.get(2)?.clone()));
   }
-  // form C: D1, ver ‖ body
-  Some((*p1.first()?, p1[1..].to_vec()))
+  // form C / C′: D1, ver ‖ body
+  let ver = *p1.first()?;
+  if ver == 0x01 && ps.len() != 2 {
+    return None;
+  }
+  Some((ver, p1[1..].to_vec()))
 }
 
 struct Reader<'a> {
@@ -298,4 +312,45 @@ mod tests {
     assert_eq!(cp.fuel, 200_000);
     assert_eq!(cp.inputs, vec![77, 1]);
   }
+
+  /// vectors/parcel.json `messages` (spec §5.1, §16.1): how a transaction's outputs classify.
+  #[test]
+  fn message_classification_vectors() {
+    let v: serde_json::Value = serde_json::from_str(include_str!("vectors/parcel.json")).unwrap();
+    for c in v["messages"].as_array().unwrap() {
+      let scripts: Vec<Vec<u8>> = c["outputs"].as_array().unwrap().iter().map(|s| hex::decode(s.as_str().unwrap()).unwrap()).collect();
+      let refs: Vec<&[u8]> = scripts.iter().map(|s| s.as_slice()).collect();
+      let kind = match tx_message(&refs) {
+        TxMessage::None => "none",
+        TxMessage::Ambiguous => "ambiguous",
+        TxMessage::One { message: Message::Call(_), .. } => "call",
+        TxMessage::One { message: Message::Parcel { .. }, .. } => "parcel",
+      };
+      assert_eq!(kind, c["kind"].as_str().unwrap(), "{}", c["name"]);
+    }
+  }
+
+  /// vectors/parcel.json `scripts`: canonical version 0x02 encodings decode to their message.
+  #[test]
+  fn parcel_script_vectors() {
+    let v: serde_json::Value = serde_json::from_str(include_str!("vectors/parcel.json")).unwrap();
+    for c in v["scripts"].as_array().unwrap() {
+      let s = hex::decode(c["script_hex"].as_str().unwrap()).unwrap();
+      let Some(Message::Parcel { pointer, edicts, call }) = decode_message(&s) else { panic!("{}", c["name"]) };
+      let m = &c["message"];
+      assert_eq!(Some(pointer as u64), m["pointer"].as_u64().or(Some(NO_POINTER as u64)), "{}", c["name"]);
+      assert_eq!(edicts.len(), m["edicts"].as_array().unwrap().len());
+      for (e, w) in edicts.iter().zip(m["edicts"].as_array().unwrap()) {
+        assert_eq!(format!("{}:{}", e.token.0, e.token.1), w["id"].as_str().unwrap());
+        assert_eq!(e.amount.to_string(), w["amount"].as_str().unwrap());
+        assert_eq!(e.output as u64, w["output"].as_u64().unwrap());
+      }
+      assert_eq!(call.is_some(), !m["call"].is_null(), "{}", c["name"]);
+      if let Some(cp) = call {
+        assert_eq!(cp.target.0.to_string(), m["call"]["targetBlock"].as_str().unwrap());
+        assert_eq!(cp.inputs.iter().map(|x| x.to_string()).collect::<Vec<_>>(), m["call"]["inputs"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect::<Vec<_>>());
+      }
+    }
+  }
 }
+

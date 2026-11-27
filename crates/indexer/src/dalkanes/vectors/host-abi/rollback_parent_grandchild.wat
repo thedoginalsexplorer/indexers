@@ -1,12 +1,12 @@
 ;; Parent at 1:0: stages its own k=0xee, then     ;; middle frame 9:3 fails after a successful call into 9:2
-    (if (i32.ne (call $call (i64.const 9) (i64.const 3) (i32.const 0) (i32.const 0)
-         (i32.const 100) (i32.const 8) (i64.const 400000)) (i32.const -1))
-      (then (i32.const 23) (return)))
+;; (if (i32.ne (call $call (i64.const 9) (i64.const 3) (i32.const 0) (i32.const 0)
+;; (i32.const 100) (i32.const 8) (i64.const 400000)) (i32.const -1))
+;; (then (i32.const 23) (return)))
     ;; calling 9:2 directly sees counter 0 -> 1 (the grandchild write was rolled back)
-    (if (i32.ne (call $call (i64.const 9) (i64.const 2) (i32.const 0) (i32.const 0)
-         (i32.const 100) (i32.const 8) (i64.const 200000)) (i32.const 8))
-      (then (i32.const 24) (return)))
-    (if (i64.ne (i64.load (i32.const 100)) (i64.const 1)) (then (i32.const 25) (return))), then returns 0.
+;; (if (i32.ne (call $call (i64.const 9) (i64.const 2) (i32.const 0) (i32.const 0)
+;; (i32.const 100) (i32.const 8) (i64.const 200000)) (i32.const 8))
+;; (then (i32.const 24) (return)))
+;; (if (i64.ne (i64.load (i32.const 100)) (i64.const 1)) (then (i32.const 25) (return))), then returns 0.
 (module
   (import "env" "storage_set" (func $set (param i32 i32 i32 i32)))
   (import "env" "call" (func $call (param i64 i64 i32 i32 i32 i32 i64) (result i32)))

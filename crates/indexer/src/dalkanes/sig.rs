@@ -35,7 +35,7 @@ fn varint(b: &[u8], i: &mut usize) -> Option<u64> {
   Some(u64::from_le_bytes(v))
 }
 
-fn put_varint(out: &mut Vec<u8>, n: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, n: u64) {
   match n {
     0..=0xfc => out.push(n as u8),
     0xfd..=0xffff => {
@@ -82,7 +82,7 @@ pub fn parse_tx(b: &[u8]) -> Option<RawTx> {
 }
 
 /// Legacy signature hash for input 0 with `script_code`, for SIGHASH_ALL with or without ANYONECANPAY.
-fn sighash_all_input0(tx: &RawTx, script_code: &[u8], hash_type: u32) -> [u8; 32] {
+pub(crate) fn sighash_all_input0(tx: &RawTx, script_code: &[u8], hash_type: u32) -> [u8; 32] {
   let anyone = hash_type & 0x80 != 0;
   let mut s = Vec::with_capacity(256);
   s.extend_from_slice(&tx.version.to_le_bytes());

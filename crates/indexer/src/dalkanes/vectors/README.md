@@ -8,6 +8,8 @@ Every vector here comes from the reference indexer's unit tests, or from the vec
 | [parser.json](parser.json) | Positive/negative strict script and cellpack cases, mirrored in Rust and both explorer test suites |
 | [host-abi/](host-abi/) | Small WAT contracts with the outputs the reference runtime is tested to produce (including nested rollback and setup-failure fuel) |
 | [block-fuel.json](block-fuel.json) | Per-block fuel budget: grants, `fuel_used` and the exhausted receipt across a block |
+| [parcel.json](parcel.json) | One message per transaction (§5.1: none, call, parcel, ambiguous), version `0x02` push forms and field limits (§16.1), routing (§16.2: clamping, skipped edicts, no split, pointer as deposit), canonical parcel scripts |
+| [sender.json](sender.json) | Verified sender (§6.5) from a real mainnet transaction whose pubkey hash contains `0xab` |
 
 The schema is in [../schemas/vectors.schema.json](../schemas/vectors.schema.json).
 

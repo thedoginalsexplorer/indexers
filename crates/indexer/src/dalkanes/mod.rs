@@ -34,6 +34,11 @@ use wire::{Message, TxMessage};
 /// Mainnet activation (§2): blocks below it have no Dalkanes effect.
 pub const ACTIVATION: u64 = 6_466_500;
 const STATE_KEY: &[u8] = b"dalk_state_v1";
+/// The rules this index was built with. Raising it clears the Dalkanes trees and replays from
+/// activation (about a minute): 2 = spec v0.4 edge-case pass (strict call forms, the pointer as a
+/// deposit, print births, 2026-11-26).
+const RULES: u64 = 2;
+const RULES_KEY: &[u8] = b"dalk_rules";
 /// Undo records and block hashes kept for reorgs.
 const KEEP: u64 = 200;
 
@@ -79,6 +84,9 @@ pub struct DeployMeta {
   pub code_hash: String,
   pub code_len: usize,
   pub time: u64,
+  /// For a print (§20): the inscribed program it was born from.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub program: Option<String>,
 }
 
 /// A call's receipt (§9).
@@ -91,6 +99,9 @@ pub struct Receipt {
   pub return_hex: String,
   pub error: Option<String>,
   pub logs: Vec<String>,
+  /// The print id this call bore (§20); consensus-relevant.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub born: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -285,7 +296,7 @@ struct BlockView {
   ledger: Tree,
   height: u64,
   /// Deploys of this block: id -> code (visible to a call at a later or equal tx index).
-  deploys: HashMap<Id, Rc<Vec<u8>>>,
+  deploys: RefCell<HashMap<Id, Rc<Vec<u8>>>>,
   store: RefCell<HashMap<(Id, Vec<u8>), Vec<u8>>>,
   led: RefCell<HashMap<Vec<u8>, u128>>,
 }
@@ -298,7 +309,7 @@ impl BlockView {
       storage: db.open_tree("dalk_storage")?,
       ledger: db.open_tree("dalk_ledger")?,
       height,
-      deploys: HashMap::new(),
+      deploys: RefCell::new(HashMap::new()),
       store: RefCell::new(HashMap::new()),
       led: RefCell::new(HashMap::new()),
     })
@@ -311,10 +322,18 @@ fn storage_key(id: Id, key: &[u8]) -> Vec<u8> {
   k
 }
 
+impl BlockView {
+  /// Whether `id` is a print (§20), born earlier in this block or before it.
+  fn is_print(&self, id: Id, births: &HashMap<Id, Id>) -> bool {
+    births.contains_key(&id)
+      || self.code.get(id_key(id)).ok().flatten().and_then(|v| serde_json::from_slice::<DeployMeta>(v.as_ref()).ok()).is_some_and(|m| m.program.is_some())
+  }
+}
+
 impl StateView for BlockView {
   fn code(&self, id: Id, height: u64, tx: u32) -> Option<Rc<Vec<u8>>> {
     if id.0 == self.height {
-      return if id.1 <= tx || height > self.height { self.deploys.get(&id).cloned() } else { None };
+      return if id.1 <= tx || height > self.height { self.deploys.borrow().get(&id).cloned() } else { None };
     }
     if id.0 > height {
       return None;
@@ -416,6 +435,84 @@ fn addr_key(addr: &str, outpoint: &[u8]) -> Vec<u8> {
   k
 }
 
+/// What a transaction's message says to do with the parcels its inputs carry (§16.2).
+pub(crate) enum Routing<'a> {
+  /// No `0xD1` output, or a version `0x01` call: everything to the first output that can hold it.
+  Default,
+  /// §5.1 ambiguous: everything burns.
+  Ambiguous,
+  Message { pointer: u32, edicts: &'a [wire::Edict] },
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Routed {
+  pub alloc: BTreeMap<u32, BTreeMap<Id, u128>>,
+  /// Routed to `u32::MAX - 1`: into the call (§16.3).
+  pub deposits: BTreeMap<Id, u128>,
+  pub burned: BTreeMap<Id, u128>,
+}
+
+/// §16.2: edicts in order (clamped, skipping tokens the inputs lack), then the rest to the pointer.
+/// An output that cannot hold a parcel (missing, or any `OP_RETURN`) burns what is sent to it;
+/// `u32::MAX - 1` deposits into the call, as an edict output or as the pointer.
+pub(crate) fn route(gathered: &BTreeMap<Id, u128>, routing: Routing, can_hold: &dyn Fn(u32) -> bool, first_real: Option<u32>) -> Routed {
+  let mut r = Routed::default();
+  let send = |r: &mut Routed, out: u32, id: Id, a: u128| {
+    if out == wire::DEPOSIT_VOUT {
+      add(&mut r.deposits, id, a);
+    } else if out != wire::NO_POINTER && can_hold(out) {
+      add(r.alloc.entry(out).or_default(), id, a);
+    } else {
+      add(&mut r.burned, id, a);
+    }
+  };
+  match routing {
+    Routing::Default => {
+      for (id, a) in gathered {
+        match first_real {
+          Some(v) => add(r.alloc.entry(v).or_default(), *id, *a),
+          None => add(&mut r.burned, *id, *a),
+        }
+      }
+    }
+    Routing::Ambiguous => {
+      for (id, a) in gathered {
+        add(&mut r.burned, *id, *a);
+      }
+    }
+    Routing::Message { pointer, edicts } => {
+      let mut avail = gathered.clone();
+      for e in edicts {
+        let Some(have) = avail.get_mut(&e.token) else { continue };
+        let amt = if e.amount == 0 { *have } else { e.amount.min(*have) };
+        if amt == 0 {
+          continue;
+        }
+        *have -= amt;
+        send(&mut r, e.output, e.token, amt);
+      }
+      for (id, a) in avail {
+        if a > 0 {
+          send(&mut r, pointer, id, a);
+        }
+      }
+    }
+  }
+  r
+}
+
+/// §16.3: a deposit the call did not keep goes to the pointer when it names an output that can hold
+/// it; otherwise (no pointer, the deposit sentinel, a missing or `OP_RETURN` output) it burns.
+pub(crate) fn refund(r: &mut Routed, deposits: &BTreeMap<Id, u128>, pointer: u32, can_hold: &dyn Fn(u32) -> bool) {
+  for (id, a) in deposits {
+    if pointer != wire::NO_POINTER && pointer != wire::DEPOSIT_VOUT && can_hold(pointer) {
+      add(r.alloc.entry(pointer).or_default(), *id, *a);
+    } else {
+      add(&mut r.burned, *id, *a);
+    }
+  }
+}
+
 /// What a call needs from the transaction: message parts and its raw bytes (for the sender).
 struct CallIn<'a> {
   cp: &'a wire::Cellpack,
@@ -429,13 +526,20 @@ struct BlockCtx<'a> {
   view: Rc<BlockView>,
   budget: u64,
   raw: &'a HashMap<String, Vec<u8>>,
+  /// Prints born in this block: print id -> program id (§20).
+  births: HashMap<Id, Id>,
 }
 
 /// Runs one call (§6), landing check included (§16). Commits it into the block view on success.
 fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxRecord) -> Option<vm::CallResult> {
   let target = c.cp.target;
   // no visible code: no effect, no receipt (§5.4)
-  ctx.view.code(target, ctx.height, i)?;
+  let code = ctx.view.code(target, ctx.height, i)?;
+  // §20: opcode 77 on an inscribed Proof or Shibkane program births a print, the pull's own block:tx,
+  // and the program runs as that id
+  let print_program = matches!(canon_of(&hex::encode(Sha256::digest(&code[..]))), Some(("proof" | "shibkane", _)));
+  let birth = print_program && c.cp.inputs.first() == Some(&77) && !ctx.view.is_print(target, &ctx.births);
+  let born: Id = (ctx.height, i);
   let value = tx.vout.iter().find(|o| o.n == c.carrier).and_then(|o| crate::to_satoshis(o.value).ok()).unwrap_or(0);
   rec.value = value;
   let sender = ctx.raw.get(&tx.txid).and_then(|r| sig::sender(r));
@@ -444,12 +548,20 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("block fuel budget exhausted".into()), ..Default::default() });
     return None;
   }
+  if birth && ctx.view.code(born, ctx.height, i).is_some() {
+    // one transaction has one id: a transaction that deployed a contract cannot also be a print
+    rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("print birth refused: this transaction already has an id".into()), ..Default::default() });
+    return None;
+  }
+  if birth {
+    ctx.view.deploys.borrow_mut().insert(born, code.clone());
+  }
   let granted = c.cp.fuel.min(vm::MAX_FUEL).max(1).min(ctx.budget);
   let env = vm::CallEnv {
     height: ctx.height,
     tx: i,
     time: ctx.time,
-    target,
+    target: if birth { born } else { target },
     fuel: granted,
     calldata: vm::calldata(&c.cp.inputs),
     value,
@@ -474,9 +586,16 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
     return_hex: hex::encode(&r.ret),
     error: r.error.clone(),
     logs: r.logs.clone(),
+    born: (birth && r.ok).then(|| fmt_id(born)),
   });
   if !r.ok {
+    if birth {
+      ctx.view.deploys.borrow_mut().remove(&born);
+    }
     return None;
+  }
+  if birth {
+    ctx.births.insert(born, target);
   }
   {
     let mut s = ctx.view.store.borrow_mut();
@@ -549,16 +668,17 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
       code_hash: hash,
       code_len: code.len(),
       time,
+      program: None,
     };
     w.put(T_CODE, id_key(id).to_vec(), Some(serde_json::to_vec(&meta)?));
     w.put(T_WASM, id_key(id).to_vec(), Some(code.clone()));
     let mut dk = b"d|".to_vec();
     dk.extend_from_slice(&hk(height, i));
     w.put(T_IDX, dk, Some(id_key(id).to_vec()));
-    view.deploys.insert(id, Rc::new(code.clone()));
+    view.deploys.borrow_mut().insert(id, Rc::new(code.clone()));
   }
   let view = Rc::new(view);
-  let mut ctx = BlockCtx { height, time, view: view.clone(), budget: vm::BLOCK_FUEL_BUDGET, raw };
+  let mut ctx = BlockCtx { height, time, view: view.clone(), budget: vm::BLOCK_FUEL_BUDGET, raw, births: HashMap::new() };
   let (mut n_tx, mut n_calls) = (0, 0);
   // 2. transactions in order: parcels and calls
   for (idx, tx) in block.tx.iter().enumerate() {
@@ -599,71 +719,31 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
       parcels_in: amounts(&gathered),
       ..Default::default()
     };
-    let mut alloc: BTreeMap<u32, BTreeMap<Id, u128>> = BTreeMap::new();
-    let mut burned: BTreeMap<Id, u128> = BTreeMap::new();
-    let mut deposited: BTreeMap<Id, u128> = BTreeMap::new();
-    let to_first = |alloc: &mut BTreeMap<u32, BTreeMap<Id, u128>>, burned: &mut BTreeMap<Id, u128>, m: &BTreeMap<Id, u128>| match first_real_output(tx) {
-      Some(v) => {
-        for (id, a) in m {
-          add(alloc.entry(v).or_default(), *id, *a);
-        }
-      }
-      None => {
-        for (id, a) in m {
-          add(burned, *id, *a);
-        }
-      }
-    };
+    let can_hold = |v: u32| is_op_return(tx, v) == Some(false);
     let mut result: Option<vm::CallResult> = None;
     let mut cp_shown: Option<&wire::Cellpack> = None;
-    match &msg {
-      TxMessage::None => to_first(&mut alloc, &mut burned, &gathered),
+    let mut deposited: BTreeMap<Id, u128> = BTreeMap::new();
+    let routed = match &msg {
+      TxMessage::None => route(&gathered, Routing::Default, &can_hold, first_real_output(tx)),
       TxMessage::Ambiguous => {
         rec.message = "ambiguous".into();
-        for (id, a) in &gathered {
-          add(&mut burned, *id, *a);
-        }
+        route(&gathered, Routing::Ambiguous, &can_hold, None)
       }
       TxMessage::One { vout, message: Message::Call(cp) } => {
         rec.message = "call".into();
         rec.carrier_vout = Some(*vout);
         cp_shown = Some(cp);
-        to_first(&mut alloc, &mut burned, &gathered);
+        let routed = route(&gathered, Routing::Default, &can_hold, first_real_output(tx));
         result = run_call(&mut ctx, tx, i, &CallIn { cp, carrier: *vout, incoming: Vec::new() }, &mut rec);
+        routed
       }
       TxMessage::One { vout, message: Message::Parcel { pointer, edicts, call } } => {
         rec.message = "parcel".into();
         rec.carrier_vout = Some(*vout);
         rec.pointer = (*pointer != wire::NO_POINTER).then_some(*pointer);
-        let mut avail = gathered.clone();
-        let mut deposits: BTreeMap<Id, u128> = BTreeMap::new();
-        for e in edicts {
-          rec.edicts.push(serde_json::json!({ "id": fmt_id(e.token), "amount": e.amount.to_string(), "output": e.output }));
-          let have = *avail.get(&e.token).unwrap_or(&0);
-          let amt = if e.amount == 0 { have } else { e.amount.min(have) };
-          if amt == 0 {
-            continue;
-          }
-          *avail.get_mut(&e.token).unwrap() -= amt;
-          if e.output == wire::DEPOSIT_VOUT {
-            add(&mut deposits, e.token, amt);
-          } else if is_op_return(tx, e.output) == Some(false) {
-            add(alloc.entry(e.output).or_default(), e.token, amt);
-          } else {
-            add(&mut burned, e.token, amt);
-          }
-        }
-        let pointer_ok = *pointer != wire::NO_POINTER && is_op_return(tx, *pointer) == Some(false);
-        let to_pointer = |alloc: &mut BTreeMap<u32, BTreeMap<Id, u128>>, burned: &mut BTreeMap<Id, u128>, m: &BTreeMap<Id, u128>| {
-          for (id, a) in m {
-            if pointer_ok {
-              add(alloc.entry(*pointer).or_default(), *id, *a);
-            } else {
-              add(burned, *id, *a);
-            }
-          }
-        };
-        to_pointer(&mut alloc, &mut burned, &avail);
+        rec.edicts = edicts.iter().map(|e| serde_json::json!({ "id": fmt_id(e.token), "amount": e.amount.to_string(), "output": e.output })).collect();
+        let mut routed = route(&gathered, Routing::Message { pointer: *pointer, edicts }, &can_hold, None);
+        let deposits = std::mem::take(&mut routed.deposits);
         if let Some(cp) = call {
           cp_shown = Some(cp);
           let incoming: Vec<(Id, u128)> = deposits.iter().filter(|(_, a)| **a > 0).map(|(k, v)| (*k, *v)).collect();
@@ -672,9 +752,27 @@ fn index_block(db: &store::Db, t: &Trees, height: u64, block: &RpcBlock, raw: &H
         if result.is_some() {
           deposited = deposits;
         } else {
-          to_pointer(&mut alloc, &mut burned, &deposits);
+          refund(&mut routed, &deposits, *pointer, &can_hold);
         }
+        routed
       }
+    };
+    let Routed { mut alloc, burned, .. } = routed;
+    if let Some(born) = rec.receipt.as_ref().and_then(|r| r.born.clone()) {
+      let pid = (height, i);
+      let program = ctx.births.get(&pid).copied().context("born print without a program")?;
+      let pm: DeployMeta = serde_json::from_slice(&w.get(T_CODE, &id_key(program))?.context("print program metadata")?)?;
+      let code = w.get(T_WASM, &id_key(program))?.context("print program code")?;
+      let meta = DeployMeta { id: born, height, tx_index: i, txid: tx.txid.clone(), time, program: Some(pm.id.clone()), ..pm };
+      w.put(T_CODE, id_key(pid).to_vec(), Some(serde_json::to_vec(&meta)?));
+      w.put(T_WASM, id_key(pid).to_vec(), Some(code));
+      let mut dk = b"d|".to_vec();
+      dk.extend_from_slice(&hk(height, i));
+      w.put(T_IDX, dk, Some(id_key(pid).to_vec()));
+      let mut ck = b"c|".to_vec();
+      ck.extend_from_slice(&id_key(pid));
+      ck.extend_from_slice(&hk(height, i));
+      w.put(T_IDX, ck, Some(tx.txid.clone().into_bytes()));
     }
     if let Some(cp) = cp_shown {
       rec.target = Some(fmt_id(cp.target));
@@ -751,6 +849,14 @@ pub async fn run_dalkanes_index(config: Config) -> Result<()> {
   let db = ii::db_of(&config)?;
   let t = Trees::open(&db)?;
   let client = indexer_rpc_client()?;
+  if ii::meta_u64(&t.meta, RULES_KEY)?.unwrap_or(1) < RULES {
+    for tree in t.t.iter().chain([&t.undo]) {
+      tree.delete_range(Vec::new(), vec![0xffu8; 96])?;
+    }
+    t.meta.remove(STATE_KEY)?;
+    t.meta.insert(RULES_KEY, RULES.to_be_bytes())?;
+    info!("dalkanes: rules are now version {RULES}; replaying from activation (block {ACTIVATION})");
+  }
   let mut st = load_state(&t.meta)?;
   info!("dalkanes: starting at block {}", st.next_height);
   let (mut last_log, mut caught_up) = (Instant::now(), false);
@@ -1302,4 +1408,201 @@ mod tests {
   fn ledger_key_of(tok: Id, acct: &[u8]) -> Vec<u8> {
     vm::ledger_key(tok, acct)
   }
+
+  fn pid(s: &str) -> Id {
+    parse_id(s).unwrap()
+  }
+
+  fn amounts_of(v: &serde_json::Value) -> Vec<(Id, u128)> {
+    let mut out: Vec<(Id, u128)> = v.as_array().unwrap().iter().map(|x| (pid(x[0].as_str().unwrap()), x[1].as_str().unwrap().parse().unwrap())).collect();
+    out.sort();
+    out
+  }
+
+  /// vectors/parcel.json `routing` (spec §16.2), mirrored from dogex `routing_edge_cases`.
+  #[test]
+  fn parcel_routing_vectors() {
+    let v: serde_json::Value = serde_json::from_str(include_str!("vectors/parcel.json")).unwrap();
+    for c in v["routing"].as_array().unwrap() {
+      let name = c["name"].as_str().unwrap();
+      let mut gathered = BTreeMap::new();
+      for (id, a) in amounts_of(&c["inputs"]) {
+        add(&mut gathered, id, a);
+      }
+      let hold: Vec<bool> = c["can_hold"].as_array().unwrap().iter().map(|b| b.as_bool().unwrap()).collect();
+      let can_hold = |o: u32| hold.get(o as usize).copied().unwrap_or(false);
+      let first_real = hold.iter().position(|b| *b).map(|i| i as u32);
+      let edicts: Vec<wire::Edict>;
+      let routing = match c["routing"]["kind"].as_str().unwrap() {
+        "default" => Routing::Default,
+        "burn" => Routing::Ambiguous,
+        "message" => {
+          let m = &c["routing"]["message"];
+          edicts = m["edicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| wire::Edict { token: pid(e["id"].as_str().unwrap()), amount: e["amount"].as_str().unwrap().parse().unwrap(), output: e["output"].as_u64().unwrap() as u32 })
+            .collect();
+          Routing::Message { pointer: m["pointer"].as_u64().map(|p| p as u32).unwrap_or(wire::NO_POINTER), edicts: &edicts }
+        }
+        k => panic!("{name}: routing kind {k}"),
+      };
+      let r = route(&gathered, routing, &can_hold, first_real);
+      let mut got: Vec<(u32, Id, u128)> = r.alloc.iter().flat_map(|(v, m)| m.iter().map(move |(id, a)| (*v, *id, *a))).collect();
+      got.sort();
+      let mut want: Vec<(u32, Id, u128)> = c["to_output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| (x[0].as_u64().unwrap() as u32, pid(x[1].as_str().unwrap()), x[2].as_str().unwrap().parse().unwrap()))
+        .collect();
+      want.sort();
+      assert_eq!(got, want, "{name}: outputs");
+      assert_eq!(r.deposits.into_iter().collect::<Vec<_>>(), amounts_of(&c["deposits"]), "{name}: deposits");
+      assert_eq!(r.burned.into_iter().collect::<Vec<_>>(), amounts_of(&c["burned"]), "{name}: burned");
+    }
+  }
+
+  /// vectors/sender.json (spec §6.5): the mainnet Howl claim whose pubkey hash contains 0xab.
+  #[test]
+  fn sender_vectors() {
+    let v: serde_json::Value = serde_json::from_str(include_str!("vectors/sender.json")).unwrap();
+    for c in v["cases"].as_array().unwrap() {
+      let raw = hex::decode(c["raw_tx_hex"].as_str().unwrap()).unwrap();
+      assert_eq!(sig::sender(&raw).map(hex::encode), c["sender_hash160"].as_str().map(str::to_string), "{}", c["name"]);
+    }
+  }
+
+  fn leb(mut v: u128, out: &mut Vec<u8>) {
+    loop {
+      let b = (v & 0x7f) as u8;
+      v >>= 7;
+      if v == 0 {
+        out.push(b);
+        return;
+      }
+      out.push(b | 0x80);
+    }
+  }
+
+  /// A one-input P2PKH transaction signed SIGHASH_ALL with `key`, carrying a call (form A).
+  fn signed_call(key: &secp256k1::SecretKey, target: Id, inputs: &[u128], vout_script: &[u8]) -> Vec<u8> {
+    let secp = secp256k1::Secp256k1::new();
+    let pk = secp256k1::PublicKey::from_secret_key(&secp, key).serialize();
+    let mut cp = Vec::new();
+    for v in [target.0 as u128, target.1 as u128, 1_000_000, inputs.len() as u128] {
+      leb(v, &mut cp);
+    }
+    for v in inputs {
+      leb(*v, &mut cp);
+    }
+    let mut payload = vec![0xd1, 0x01];
+    payload.extend_from_slice(&cp);
+    let mut call = vec![0x6a, payload.len() as u8];
+    call.extend_from_slice(&payload);
+    let ser = |script_sig: &[u8]| {
+      let mut t = 1i32.to_le_bytes().to_vec();
+      t.push(1);
+      t.extend_from_slice(&[0x11; 32]);
+      t.extend_from_slice(&0u32.to_le_bytes());
+      sig::put_varint(&mut t, script_sig.len() as u64);
+      t.extend_from_slice(script_sig);
+      t.extend_from_slice(&u32::MAX.to_le_bytes());
+      t.push(2);
+      for (value, script) in [(0u64, &call[..]), (100_000u64, vout_script)] {
+        t.extend_from_slice(&value.to_le_bytes());
+        sig::put_varint(&mut t, script.len() as u64);
+        t.extend_from_slice(script);
+      }
+      t.extend_from_slice(&0u32.to_le_bytes());
+      t
+    };
+    let unsigned = sig::parse_tx(&ser(&[])).unwrap();
+    let mut code = vec![0x76, 0xa9, 0x14];
+    code.extend_from_slice(&sig::hash160(&pk));
+    code.extend_from_slice(&[0x88, 0xac]);
+    let digest = sig::sighash_all_input0(&unsigned, &code, 1);
+    let s = secp.sign_ecdsa(&secp256k1::Message::from_digest_slice(&digest).unwrap(), key);
+    let mut der = s.serialize_der().to_vec();
+    der.push(0x01);
+    let mut script_sig = vec![der.len() as u8];
+    script_sig.extend_from_slice(&der);
+    script_sig.push(pk.len() as u8);
+    script_sig.extend_from_slice(&pk);
+    ser(&script_sig)
+  }
+
+  fn call_tx(txid: &str, raw: &[u8]) -> serde_json::Value {
+    let t = sig::parse_tx(raw).unwrap();
+    let mut i = 0usize;
+    let mut outs = Vec::new();
+    for n in 0..t.n_outputs {
+      let value = u64::from_le_bytes(t.outputs_raw[i..i + 8].try_into().unwrap());
+      let l = t.outputs_raw[i + 8] as usize;
+      let script = hex::encode(&t.outputs_raw[i + 9..i + 9 + l]);
+      i += 9 + l;
+      outs.push(serde_json::json!({ "value": value as f64 / 1e8, "n": n, "scriptPubKey": { "hex": script, "addresses": if n == 1 { serde_json::json!(["DPuller"]) } else { serde_json::Value::Null } } }));
+    }
+    txj(txid, serde_json::json!([{ "txid": "11".repeat(32), "vout": 0 }]), serde_json::Value::Array(outs))
+  }
+
+  /// §20: opcode 77 on the inscribed Proof program births a print with the pull's own id; the
+  /// program runs as the print; a later 77 on the program births another; 77 on a print births none.
+  #[test]
+  fn proof_print_births() {
+    let db = store::Db::temporary().unwrap();
+    let t = Trees::open(&db).unwrap();
+    let body = hex::decode(include_str!("vectors/proof-deploy.hex").trim()).unwrap();
+    let h0 = 6_480_000u64;
+    let insc = format!("{}i0", "ab".repeat(32));
+    t.seq.insert(ii::seq_key(h0, 1), bincode::serialize(&SeqEntry { id: insc.clone(), kinds: 0, time: 0 }).unwrap()).unwrap();
+    t.content.insert(insc.as_bytes(), bincode::serialize(&crate::InscriptionContentRecord { content_type: "application/wasm".into(), body, delegate: None }).unwrap()).unwrap();
+    let mut st = State { next_height: h0 + 1, ..Default::default() };
+    let mut txs = filler(1, h0);
+    txs.push(txj(&"ab".repeat(32), serde_json::json!([{}]), serde_json::json!([{ "value": 0.001, "n": 0, "scriptPubKey": { "hex": "51" } }])));
+    index_block(&db, &t, h0, &block(h0, txs), &HashMap::new(), &st).unwrap();
+    let meta: DeployMeta = serde_json::from_slice(&t.get(T_CODE, &id_key((h0, 1))).unwrap().unwrap()).unwrap();
+    assert_eq!(canon_of(&meta.code_hash).map(|c| c.0), Some("proof"));
+
+    let key = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let p2pkh = hex::decode("76a914000000000000000000000000000000000000000088ac").unwrap();
+    let pull = |h: u64, target: Id, st: &mut State| -> TxRecord {
+      let raw = signed_call(&key, target, &[77, 1], &p2pkh);
+      let txid = format!("{:064x}", h);
+      let mut txs = filler(1, h);
+      txs.push(call_tx(&txid, &raw));
+      let mut rawmap = HashMap::new();
+      rawmap.insert(txid.clone(), raw);
+      st.next_height = h + 1;
+      index_block(&db, &t, h, &block(h, txs), &rawmap, st).unwrap();
+      serde_json::from_slice(&t.get(T_TX, txid.as_bytes()).unwrap().unwrap()).unwrap()
+    };
+    // first pull: a print is born at (h0+1, 1)
+    let r = pull(h0 + 1, (h0, 1), &mut st);
+    let rc = r.receipt.unwrap();
+    assert!(rc.ok, "{:?}", rc.error);
+    assert!(r.sender.is_some());
+    let born = fmt_id((h0 + 1, 1));
+    assert_eq!(rc.born.as_deref(), Some(born.as_str()));
+    assert_eq!(r.parcels_out.len(), 1);
+    assert_eq!((r.parcels_out[0].id.as_str(), r.parcels_out[0].amount.as_str(), r.parcels_out[0].vout), (born.as_str(), "1", 1));
+    let pm: DeployMeta = serde_json::from_slice(&t.get(T_CODE, &id_key((h0 + 1, 1))).unwrap().unwrap()).unwrap();
+    assert_eq!(pm.program.as_deref(), Some(fmt_id((h0, 1)).as_str()));
+    // the pull's storage belongs to the print, not the program
+    assert_eq!(count_prefix(&t.t[T_STORAGE as usize], &id_key((h0, 1))).unwrap(), 0);
+    assert!(count_prefix(&t.t[T_STORAGE as usize], &id_key((h0 + 1, 1))).unwrap() > 0);
+    // a later 77 on the program births another print
+    let r = pull(h0 + 2, (h0, 1), &mut st);
+    assert_eq!(r.receipt.unwrap().born.as_deref(), Some(fmt_id((h0 + 2, 1)).as_str()));
+    // 77 on a print births nothing, and the print was already pulled
+    let r = pull(h0 + 3, (h0 + 1, 1), &mut st);
+    let rc = r.receipt.unwrap();
+    assert!(!rc.ok && rc.born.is_none(), "{rc:?}");
+    assert!(t.get(T_CODE, &id_key((h0 + 3, 1))).unwrap().is_none());
+    // a reorg takes the print back
+    undo_block(&t, h0 + 2, &st).unwrap();
+    assert!(t.get(T_CODE, &id_key((h0 + 2, 1))).unwrap().is_none());
+  }
 }
+

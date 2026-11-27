@@ -1,0 +1,14 @@
+{
+  "protocol": "dalkanes",
+  "spec_version": "0.4",
+  "notes": "Verified sender (spec §6.5). raw_tx_hex is a whole transaction; sender_hash160 is the 20-byte HASH160 an indexer must report for it, or null for no sender. The legacy sighash needs only the transaction and the P2PKH script code for the key in input 0.",
+  "cases": [
+    {
+      "name": "howl_mainnet_claim_has_a_sender",
+      "source": "dogex src/alkanes/sender.rs test howl_mainnet_claim_has_a_sender (mainnet tx 9d361c832deea6288143af01a49fb463235c6ad9ad77f9ac440ef5c40dda7e96, block 6,474,090)",
+      "raw_tx_hex": "02000000014eb44ca271c7c0d512e9096b2676b315451412538fbe97c21e21fc757a84a411030000006b483045022100bb670cb3b5c1dd4ee3a5314a01a54fd51953bdc66bfa6e806c0d5402e9b61f6f0220677fb5200f4223b3b167de52f17fd02f6269b6aa9df2a32197d63723425d2b1901210323cb4e375dfb2356d7ce7dfb6bc53da14bcad9e4c675f515c6aaa18f950c85fcffffffff020024f400000000000f6a0dd101e2928b0323c09a0c024d014007e604000000001976a9149dabb48cc18082a37ff23d46f891f5f9256d8d1288ac00000000",
+      "sender_hash160": "9dabb48cc18082a37ff23d46f891f5f9256d8d12",
+      "why": "The pubkey hash contains the byte 0xab (OP_CODESEPARATOR). The script code is the P2PKH script as data; removing 0xab bytes from inside the 20-byte push changes the sighash and loses the sender. The call is a Howl claim (opcode 77, output 1) that burns 0.16 DOGE on the carrier."
+    }
+  ]
+}

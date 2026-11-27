@@ -1,0 +1,767 @@
+{
+  "protocol": "dalkanes",
+  "spec_version": "0.4",
+  "notes": "messages: each case is the output scripts of one transaction; kind is how spec §5.1 classifies it (none, call, parcel, ambiguous). routing: spec §16 with amounts as decimal strings; to_output is [vout, id, amount] in credit order; deposits are what the call would receive (refunded to the pointer, or burned, if the call does not succeed). Zero amounts are omitted. scripts: canonical single-push version 0x02 encodings.",
+  "messages": [
+    {
+      "name": "no_d1_output",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "76a914000000000000000000000000000000000000000088ac"
+      ],
+      "kind": "none"
+    },
+    {
+      "name": "one_call",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "76a914000000000000000000000000000000000000000088ac",
+        "6a08d1010a02e8070163"
+      ],
+      "kind": "call",
+      "vout": 1
+    },
+    {
+      "name": "one_parcel",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a05d102000000",
+        "76a914000000000000000000000000000000000000000088ac"
+      ],
+      "kind": "parcel",
+      "vout": 0
+    },
+    {
+      "name": "parcel_truncated_varint",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a05d1020000ff"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "call_push_runs_past_end",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a08d1010a02"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "unknown_version",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a03d10300"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "magic_only",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a01d1"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "call_and_parcel",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a08d1010a02e8070163",
+        "6a05d102000000"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "two_calls",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a08d1010a02e8070163",
+        "6a08d1010a02e8070163"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "other_protocol_op_return",
+      "source": "dogex src/alkanes/wire.rs test message_classification",
+      "outputs": [
+        "6a02d001",
+        "76a914000000000000000000000000000000000000000088ac"
+      ],
+      "kind": "none"
+    },
+    {
+      "name": "call_form_a_with_trailing_empty_push",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a08d1010a02e807016300"
+      ],
+      "kind": "ambiguous",
+      "note": "Form A is exactly one push. OP_0 is a push, so this is not form A, B or C."
+    },
+    {
+      "name": "call_form_a_then_non_push_opcode",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a08d1010a02e807016351"
+      ],
+      "kind": "call",
+      "vout": 0,
+      "note": "OP_1 (0x51) is not a push opcode here; parsing stops successfully before it."
+    },
+    {
+      "name": "parcel_two_push",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a01d10402000000"
+      ],
+      "kind": "parcel",
+      "vout": 0
+    },
+    {
+      "name": "parcel_single_push_with_trailing_push",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a05d10200000001aa"
+      ],
+      "kind": "parcel",
+      "vout": 0,
+      "note": "Unlike call form A, a parcel push may be followed by more pushes."
+    },
+    {
+      "name": "parcel_three_push_split_version",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a01d1010203000000"
+      ],
+      "kind": "ambiguous",
+      "note": "The version byte must start the push that carries the body."
+    },
+    {
+      "name": "parcel_pushdata1",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a4c05d102000000"
+      ],
+      "kind": "parcel",
+      "vout": 0
+    },
+    {
+      "name": "parcel_pointer_past_u32",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a09d10280808080100000"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "parcel_has_call_two",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a05d102000002"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "parcel_missing_has_call",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a04d1020000"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "parcel_seventeen_edicts",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a05d102001100"
+      ],
+      "kind": "ambiguous"
+    },
+    {
+      "name": "d1_not_first_push",
+      "source": "dogex src/alkanes/wire.rs test message_edge_cases",
+      "outputs": [
+        "6a01aa01d1",
+        "76a914000000000000000000000000000000000000000088ac"
+      ],
+      "kind": "none"
+    }
+  ],
+  "routing": [
+    {
+      "name": "no_message_goes_to_the_first_real_output",
+      "source": "dogex src/alkanes/parcel.rs tests",
+      "inputs": [
+        [
+          "10:2",
+          "5"
+        ]
+      ],
+      "routing": {
+        "kind": "default"
+      },
+      "can_hold": [
+        false,
+        true,
+        true
+      ],
+      "to_output": [
+        [
+          1,
+          "10:2",
+          "5"
+        ]
+      ],
+      "deposits": [],
+      "burned": []
+    },
+    {
+      "name": "no_message_every_output_op_return_burns",
+      "source": "dogex src/alkanes/parcel.rs tests",
+      "inputs": [
+        [
+          "10:2",
+          "5"
+        ]
+      ],
+      "routing": {
+        "kind": "default"
+      },
+      "can_hold": [
+        false
+      ],
+      "to_output": [],
+      "deposits": [],
+      "burned": [
+        [
+          "10:2",
+          "5"
+        ]
+      ]
+    },
+    {
+      "name": "ambiguous_burns",
+      "source": "dogex src/alkanes/parcel.rs tests",
+      "inputs": [
+        [
+          "10:2",
+          "5"
+        ]
+      ],
+      "routing": {
+        "kind": "burn"
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [],
+      "deposits": [],
+      "burned": [
+        [
+          "10:2",
+          "5"
+        ]
+      ]
+    },
+    {
+      "name": "explicit_empty_pointer_burns_the_remainder",
+      "source": "dogex src/alkanes/parcel.rs tests",
+      "inputs": [
+        [
+          "10:2",
+          "5"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": null,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "2",
+              "output": 0
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        false
+      ],
+      "to_output": [
+        [
+          0,
+          "10:2",
+          "2"
+        ]
+      ],
+      "deposits": [],
+      "burned": [
+        [
+          "10:2",
+          "3"
+        ]
+      ]
+    },
+    {
+      "name": "pointer_moves_the_balance",
+      "source": "dogex src/alkanes/parcel.rs tests",
+      "inputs": [
+        [
+          "10:2",
+          "9"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 1,
+          "edicts": [],
+          "call": null
+        }
+      },
+      "can_hold": [
+        false,
+        true
+      ],
+      "to_output": [
+        [
+          1,
+          "10:2",
+          "9"
+        ]
+      ],
+      "deposits": [],
+      "burned": []
+    },
+    {
+      "name": "every_op_return_burns_not_just_the_first",
+      "source": "dogex src/alkanes/parcel.rs tests",
+      "inputs": [
+        [
+          "10:2",
+          "10"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 0,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "3",
+              "output": 2
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        false,
+        false
+      ],
+      "to_output": [
+        [
+          0,
+          "10:2",
+          "7"
+        ]
+      ],
+      "deposits": [],
+      "burned": [
+        [
+          "10:2",
+          "3"
+        ]
+      ]
+    },
+    {
+      "name": "deposit_is_not_an_output",
+      "source": "dogex src/alkanes/parcel.rs tests",
+      "inputs": [
+        [
+          "10:2",
+          "10"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 1,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "4",
+              "output": 4294967294
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [
+        [
+          1,
+          "10:2",
+          "6"
+        ]
+      ],
+      "deposits": [
+        [
+          "10:2",
+          "4"
+        ]
+      ],
+      "burned": []
+    },
+    {
+      "name": "edict_amount_clamps_to_the_balance",
+      "source": "dogex src/alkanes/parcel.rs test routing_edge_cases",
+      "inputs": [
+        [
+          "10:2",
+          "5"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 1,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "9",
+              "output": 0
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [
+        [
+          0,
+          "10:2",
+          "5"
+        ]
+      ],
+      "deposits": [],
+      "burned": []
+    },
+    {
+      "name": "edict_for_a_token_not_on_the_inputs_is_skipped",
+      "source": "dogex src/alkanes/parcel.rs test routing_edge_cases",
+      "inputs": [
+        [
+          "10:2",
+          "5"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 1,
+          "edicts": [
+            {
+              "id": "1:0",
+              "amount": "3",
+              "output": 0
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [
+        [
+          1,
+          "10:2",
+          "5"
+        ]
+      ],
+      "deposits": [],
+      "burned": []
+    },
+    {
+      "name": "edict_to_output_count_burns_no_split",
+      "source": "dogex src/alkanes/parcel.rs test routing_edge_cases",
+      "inputs": [
+        [
+          "10:2",
+          "6"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 0,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "6",
+              "output": 2
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [],
+      "deposits": [],
+      "burned": [
+        [
+          "10:2",
+          "6"
+        ]
+      ]
+    },
+    {
+      "name": "edict_zero_takes_the_rest",
+      "source": "dogex src/alkanes/parcel.rs test routing_edge_cases",
+      "inputs": [
+        [
+          "10:2",
+          "7"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 0,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "0",
+              "output": 1
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [
+        [
+          1,
+          "10:2",
+          "7"
+        ]
+      ],
+      "deposits": [],
+      "burned": []
+    },
+    {
+      "name": "edicts_of_one_token_run_in_order",
+      "source": "dogex src/alkanes/parcel.rs test routing_edge_cases",
+      "inputs": [
+        [
+          "10:2",
+          "10"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": null,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "3",
+              "output": 0
+            },
+            {
+              "id": "10:2",
+              "amount": "0",
+              "output": 1
+            },
+            {
+              "id": "10:2",
+              "amount": "5",
+              "output": 0
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [
+        [
+          0,
+          "10:2",
+          "3"
+        ],
+        [
+          1,
+          "10:2",
+          "7"
+        ]
+      ],
+      "deposits": [],
+      "burned": []
+    },
+    {
+      "name": "pointer_can_be_the_deposit",
+      "source": "dogex src/alkanes/parcel.rs test routing_edge_cases",
+      "inputs": [
+        [
+          "10:2",
+          "8"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 4294967294,
+          "edicts": [
+            {
+              "id": "10:2",
+              "amount": "2",
+              "output": 0
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true
+      ],
+      "to_output": [
+        [
+          0,
+          "10:2",
+          "2"
+        ]
+      ],
+      "deposits": [
+        [
+          "10:2",
+          "6"
+        ]
+      ],
+      "burned": []
+    },
+    {
+      "name": "inputs_of_one_token_merge",
+      "source": "dogex src/alkanes/parcel.rs test routing_edge_cases",
+      "inputs": [
+        [
+          "10:2",
+          "3"
+        ],
+        [
+          "1:0",
+          "4"
+        ],
+        [
+          "10:2",
+          "2"
+        ]
+      ],
+      "routing": {
+        "kind": "message",
+        "message": {
+          "pointer": 1,
+          "edicts": [
+            {
+              "id": "1:0",
+              "amount": "4",
+              "output": 0
+            }
+          ],
+          "call": null
+        }
+      },
+      "can_hold": [
+        true,
+        true
+      ],
+      "to_output": [
+        [
+          0,
+          "1:0",
+          "4"
+        ],
+        [
+          1,
+          "10:2",
+          "5"
+        ]
+      ],
+      "deposits": [],
+      "burned": []
+    }
+  ],
+  "scripts": [
+    {
+      "name": "send_four_keep_the_rest",
+      "message": {
+        "pointer": 2,
+        "edicts": [
+          {
+            "id": "6474082:35",
+            "amount": "4",
+            "output": 1
+          }
+        ],
+        "call": null
+      },
+      "script_hex": "6a0cd1020201e2928b0323040100"
+    },
+    {
+      "name": "swap_deposit_with_call",
+      "message": {
+        "pointer": 1,
+        "edicts": [
+          {
+            "id": "6474082:35",
+            "amount": "16",
+            "output": 4294967294
+          }
+        ],
+        "call": {
+          "targetBlock": "6474999",
+          "targetTx": "3",
+          "fuel": "1000000",
+          "inputs": [
+            "2",
+            "0",
+            "1"
+          ]
+        }
+      },
+      "script_hex": "6a1cd1020101e2928b032310feffffff0f01f7998b0303c0843d03020001"
+    },
+    {
+      "name": "burn_everything",
+      "message": {
+        "pointer": null,
+        "edicts": [],
+        "call": null
+      },
+      "script_hex": "6a09d102ffffffff0f0000"
+    }
+  ]
+}
