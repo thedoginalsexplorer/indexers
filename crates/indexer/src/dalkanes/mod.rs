@@ -1331,7 +1331,51 @@ pub struct ContractSummary {
   pub card: Option<ProjectCard>,
 }
 
+/// The ids a print program (Proof, Shibkane, Doge Orbital; §20) has born, in birth order, read from its
+/// own storage (0x10 count, 0x11 ‖ n id). `None` when `id` is not a print program.
+fn print_ids_of(t: &Trees, id: Id) -> Result<Option<Vec<Id>>> {
+  let Some(raw) = t.get(T_CODE, &id_key(id))? else { return Ok(None) };
+  let meta: DeployMeta = serde_json::from_slice(&raw)?;
+  if !meta_may_be(&meta, "collection") {
+    return Ok(None);
+  }
+  let st = |key: &[u8]| -> Result<Option<Vec<u8>>> { t.get(T_STORAGE, &storage_key(id, key)) };
+  let count = st(&[0x10])?.map(|v| u64_le(&v)).unwrap_or(0).min(PROOF_CAP);
+  let mut ids = Vec::new();
+  for n in 0..count {
+    let mut k = vec![0x11];
+    k.extend_from_slice(&(n as u32).to_le_bytes());
+    if let Some(v) = st(&k)? {
+      if v.len() >= 16 {
+        ids.push((u64_le(&v[..8]), u64_le(&v[8..16]) as u32));
+      }
+    }
+  }
+  Ok(Some(ids))
+}
+
+/// Who holds a contract: balances of its own id, except for a print program, whose units live on its
+/// prints (a print is a contract of its own with a supply of 1): there the holders are the owners of
+/// its prints, `amount` is how many each holds, and the total is the prints held.
 fn holders_of(t: &Trees, id: Id) -> Result<(Vec<(String, u128, usize)>, u128)> {
+  let Some(ids) = print_ids_of(t, id)? else { return holders_raw(t, id) };
+  let mut by: BTreeMap<String, (u128, usize)> = BTreeMap::new();
+  let mut total: u128 = 0;
+  for pid in ids {
+    let (rows, circ) = holders_raw(t, pid)?;
+    total = total.saturating_add(circ);
+    for (a, n, o) in rows {
+      let e = by.entry(a).or_insert((0, 0));
+      e.0 = e.0.saturating_add(n);
+      e.1 += o;
+    }
+  }
+  let mut v: Vec<(String, u128, usize)> = by.into_iter().map(|(a, (n, o))| (a, n, o)).collect();
+  v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+  Ok((v, total))
+}
+
+fn holders_raw(t: &Trees, id: Id) -> Result<(Vec<(String, u128, usize)>, u128)> {
   let mut prefix = b"h|".to_vec();
   prefix.extend_from_slice(&id_key(id));
   let mut by: BTreeMap<String, (u128, usize)> = BTreeMap::new();
@@ -2504,6 +2548,30 @@ mod tests {
     let (page, total) = page_contract_metas(&t, 0, 10, true).unwrap();
     assert_eq!(total, 7);
     assert_eq!(page[0].id, "14:2");
+  }
+
+  /// A print program's holders are the owners of its prints (the units live on the prints, not on the program id).
+  #[test]
+  fn print_program_holders_come_from_its_prints() {
+    let db = store::Db::temporary().unwrap();
+    let t = Trees::open(&db).unwrap();
+    let hash = "7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694";
+    let program = (1000u64, 7u32);
+    t.t[T_CODE as usize].insert(id_key(program), serde_json::to_vec(&meta_at(1000, 7, None, hash)).unwrap()).unwrap();
+    // three prints: A holds two, B one
+    t.t[T_STORAGE as usize].insert(storage_key(program, &[0x10]), 3u64.to_le_bytes().to_vec()).unwrap();
+    for (n, (owner, vout)) in [("DAAAA", 0), ("DBBBB", 1), ("DAAAA", 2)].into_iter().enumerate() {
+      let pid = (2000 + n as u64, 1u32);
+      let mut v = pid.0.to_le_bytes().to_vec();
+      v.extend_from_slice(&(pid.1 as u64).to_le_bytes());
+      t.t[T_STORAGE as usize].insert(storage_key(program, &[&[0x11u8][..], &(n as u32).to_le_bytes()[..]].concat()), v).unwrap();
+      t.t[T_IDX as usize].insert(holder_key(pid, owner, format!("{}:{vout}", "ab".repeat(32)).as_bytes()), 1u128.to_le_bytes().to_vec()).unwrap();
+    }
+    let (h, circ) = holders_of(&t, program).unwrap();
+    assert_eq!(circ, 3);
+    assert_eq!(h.iter().map(|x| (x.0.as_str(), x.1, x.2)).collect::<Vec<_>>(), [("DAAAA", 2, 2), ("DBBBB", 1, 1)]);
+    // a plain contract still reads its own balances
+    assert!(holders_of(&t, (9, 9)).unwrap().0.is_empty());
   }
 
   /// A print program's once-per-sender flag is the 0x15‖sender key, not a slice of recent txs.
