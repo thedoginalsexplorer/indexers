@@ -576,7 +576,10 @@ fn run_frame(module: Option<Module>, frame: Frame, granted: u64, calldata: &[u8]
     Err(e) => {
       let msg = store.data().fatal.clone().unwrap_or_else(|| trap_text(&e));
       let ret = std::mem::take(&mut store.data_mut().ret);
-      FrameOut { ok: false, fuel_used: used(&store), ret, error: Some(msg) }
+      // §6.3: an out-of-fuel trap leaves 0 fuel, so the whole grant is used. wasmi refuses an instruction
+      // block it cannot pay for without taking the remainder, so the meter alone can read less than the grant.
+      let spent = if e.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel) { granted } else { used(&store) };
+      FrameOut { ok: false, fuel_used: spent, ret, error: Some(msg) }
     }
   }
 }
@@ -733,6 +736,23 @@ mod tests {
         want.sort();
         assert_eq!(got, want, "{name}");
       }
+    }
+  }
+
+  /// §6.3 (spec 43721d9): an out-of-fuel trap leaves 0 fuel, so `fuel_used` is the whole grant, not 0 and not less.
+  #[test]
+  fn out_of_fuel_records_the_grant() {
+    let code = wat::parse_str(r#"(module (memory (export "memory") 1)
+      (func (export "__dalk_execute") (param i32 i32) (result i32) (loop $l (br $l)) (i32.const 0)))"#).unwrap();
+    let engine = engine();
+    for fuel in [1u64, 2, 7, 1000, 12_345] {
+      let mut m = Mem::default();
+      m.code.insert((1, 0), Rc::new(code.clone()));
+      let env = CallEnv { height: 1, tx: 0, time: 0, target: (1, 0), fuel, calldata: Vec::new(), value: 0, sender: None, incoming: vec![], caller: (0, 0) };
+      let r = execute(&engine, Rc::new(m), &env);
+      assert!(!r.ok);
+      assert_eq!(r.error.as_deref(), Some("out of fuel"), "fuel {fuel}");
+      assert_eq!(r.fuel_used, fuel, "fuel {fuel}");
     }
   }
 

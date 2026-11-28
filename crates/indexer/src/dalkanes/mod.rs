@@ -54,7 +54,7 @@ const CANON: &[(&str, &str, &str)] = &[
   // one: the superseded bodies 43a9ebb3 (Proof), 3cba3028 and 9e9bfc04 (Shibkane) get no label and no gate.
   ("7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694", "proof", "Proof"),
   ("b69f0aa9b8cd66335d1c08fa6c86d3af7d6b0def30c8d8688eff6ebefe9c71a4", "shibkane", "Shibkane"),
-  ("aeafccfee33779532d930b86bfbd2fbb0e5519db072dc26e29888e3c4040a4c4", "doge", "Doge Orbital"),
+  ("119e9ce93d3c7291167fdc86ba74320c7926ba98b94fb23aad194fdafa70ffef", "doge", "Doge Orbital"),
   ("ee4c6e7ba6096c1ed5908485135a107f793f8295c2baa0c6e4734a8c9e16a3dd", "kibble", "Kibble"),
   // §17 fair-launch: official dogex launch/build for DogePay / DPAY, cap 21,000,000, 10,000 per mint.
   // Hash is SHA-256 of the wasm after the \0ALK\x01 header (same method as the §24 table).
@@ -728,10 +728,6 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
   rec.value = value;
   let sender = ctx.raw.get(&tx.txid).and_then(|r| sig::sender(r));
   rec.sender = sender.as_ref().map(p2pkh_address);
-  if ctx.budget == 0 {
-    rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("block fuel budget exhausted".into()), ..Default::default() });
-    return None;
-  }
   if birth && ctx.view.code(born, ctx.height, i).is_some() {
     // one transaction has one id: a transaction that deployed a contract cannot also be a print
     rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("print birth refused: this transaction already has an id".into()), ..Default::default() });
@@ -747,6 +743,11 @@ fn run_call(ctx: &mut BlockCtx, tx: &RpcTx, i: u32, c: &CallIn, rec: &mut TxReco
       rec.receipt = Some(Receipt { target: fmt_id(target), error: Some(why.into()), ..Default::default() });
       return None;
     }
+  }
+  // §6.2 (spec 43721d9): the budget test comes after the gate, so a refused pull keeps the gate's receipt even when R is 0
+  if ctx.budget == 0 {
+    rec.receipt = Some(Receipt { target: fmt_id(target), error: Some("block fuel budget exhausted".into()), ..Default::default() });
+    return None;
   }
   if birth {
     ctx.view.deploys.borrow_mut().insert(born, code.clone());
@@ -2027,7 +2028,7 @@ mod tests {
     // §24: the print programs, and the superseded bodies that are not
     assert_eq!(canon_of("7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694").unwrap().0, "proof");
     assert_eq!(canon_of("b69f0aa9b8cd66335d1c08fa6c86d3af7d6b0def30c8d8688eff6ebefe9c71a4").unwrap().0, "shibkane");
-    assert_eq!(canon_of("aeafccfee33779532d930b86bfbd2fbb0e5519db072dc26e29888e3c4040a4c4").unwrap().0, "doge");
+    assert_eq!(canon_of("119e9ce93d3c7291167fdc86ba74320c7926ba98b94fb23aad194fdafa70ffef").unwrap().0, "doge");
     for old in [
       "43a9ebb3a709a6622d15df9328670aea26ffb4c30a9f65fe8e78848fa142183c",
       "3cba30282ed8344d15416e980c997cb8197d3d587972ea9c3df93a261ae89bf0",
