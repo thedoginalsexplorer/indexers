@@ -1377,22 +1377,91 @@ fn summary(config: &Config, t: &Trees, meta: DeployMeta, height: u64) -> Result<
 }
 
 /// Contracts, newest first.
-/// Inscribed contracts, newest first. `prints: false` leaves out the ids born by a pull (§20), so the
-/// factories and tokens can't be pushed off a page by a collection's prints.
-pub fn dalk_contracts(config: &Config, offset: usize, limit: usize, prints: bool) -> Result<(Vec<ContractSummary>, usize)> {
-  let t = read_trees(config)?;
-  let height = load_state(&t.meta)?.next_height.saturating_sub(1);
-  let mut all = Vec::new();
+/// One page of inscribed contracts, newest first. Walks the code tree once, counts matches, and only
+/// materialises `limit` metas (and their summaries). `prints: false` leaves out ids born by a pull (§20),
+/// so the factories and tokens can't be pushed off a page by a collection's prints.
+fn page_contract_metas(t: &Trees, offset: usize, limit: usize, prints: bool) -> Result<(Vec<DeployMeta>, usize)> {
+  let mut total = 0usize;
+  let mut out = Vec::new();
   t.t[T_CODE as usize].for_each_rev_from(b"", |_, v| {
     let m = serde_json::from_slice::<DeployMeta>(v)?;
     if prints || m.program.is_none() {
-      all.push(m);
+      if total >= offset && out.len() < limit {
+        out.push(m);
+      }
+      total += 1;
     }
     Ok(true)
   })?;
-  let total = all.len();
-  let out = all.into_iter().skip(offset).take(limit).map(|m| summary(config, &t, m, height)).collect::<Result<_>>()?;
   Ok((out, total))
+}
+
+pub fn dalk_contracts(config: &Config, offset: usize, limit: usize, prints: bool) -> Result<(Vec<ContractSummary>, usize)> {
+  let t = read_trees(config)?;
+  let height = load_state(&t.meta)?.next_height.saturating_sub(1);
+  let (page, total) = page_contract_metas(&t, offset, limit, prints)?;
+  let out = page.into_iter().map(|m| summary(config, &t, m, height)).collect::<Result<_>>()?;
+  Ok((out, total))
+}
+
+/// Whether `sender` has already taken this contract's once-per-address claim. Print programs use key
+/// `0x15 ‖ sender` (§20.1). Other builds try opcode 106 (Howl, §18) and, if that is not a yes/no
+/// view, any successful receipt from this sender. `None` if the id is not a contract.
+pub fn dalk_sender_claimed(config: &Config, id: Id, sender: [u8; 20]) -> Result<Option<bool>> {
+  let db = ii::db_of(config)?;
+  let t = Trees::open(&db)?;
+  sender_claimed_in(&t, Some(&db), id, sender)
+}
+
+fn sender_claimed_in(t: &Trees, db: Option<&store::Db>, id: Id, sender: [u8; 20]) -> Result<Option<bool>> {
+  let Some(raw) = t.get(T_CODE, &id_key(id))? else { return Ok(None) };
+  let meta: DeployMeta = serde_json::from_slice(&raw)?;
+  let print_program = meta.program.is_none()
+    && canon_of(&meta.code_hash).is_some_and(|c| matches!(c.0, "proof" | "shibkane" | "doge"));
+  if print_program {
+    let v = t.get(T_STORAGE, &storage_key(id, &[&[0x15u8][..], &sender[..]].concat()))?;
+    return Ok(Some(v.as_deref() == Some(&[0x01])));
+  }
+  if let Some(db) = db {
+    let height = load_state(&t.meta)?.next_height;
+    let view: Rc<dyn StateView> = Rc::new(DbView {
+      wasm: db.open_tree("dalk_wasm")?,
+      storage: db.open_tree("dalk_storage")?,
+      ledger: db.open_tree("dalk_ledger")?,
+    });
+    let env = vm::CallEnv {
+      height,
+      tx: u32::MAX,
+      time: 0,
+      target: id,
+      fuel: 1_000_000,
+      calldata: vm::calldata(&[106]),
+      sender: Some(sender),
+      ..Default::default()
+    };
+    let r = vm::execute(&ENGINE, view, &env);
+    if r.ok {
+      return Ok(Some(r.ret.first() == Some(&1)));
+    }
+  }
+  let addr = p2pkh_address(&sender);
+  let mut p = b"c|".to_vec();
+  p.extend_from_slice(&id_key(id));
+  let mut found = false;
+  t.t[T_IDX as usize].for_each_prefix(&p, |_, v| {
+    if found {
+      return Ok(true);
+    }
+    let txid = String::from_utf8_lossy(v);
+    if let Some(raw) = t.get(T_TX, txid.as_bytes())? {
+      let rec: TxRecord = serde_json::from_slice(&raw)?;
+      if rec.sender.as_deref() == Some(addr.as_str()) && rec.receipt.as_ref().is_some_and(|x| x.ok) {
+        found = true;
+      }
+    }
+    Ok(true)
+  })?;
+  Ok(Some(found))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2209,5 +2278,59 @@ mod tests {
     assert!(parse_card(format!(r#"{{"dalkane":"1:2","image":"{img}","links":[{{"label":"x","url":"ftp://a.b"}}]}}"#).as_bytes()).is_none());
     assert!(parse_card(format!(r#"{{"dalkane":"1:2","image":"{img}","name":""}}"#).as_bytes()).is_none());
   }
-}
 
+  fn meta_at(h: u64, tx: u32, program: Option<&str>, hash: &str) -> DeployMeta {
+    DeployMeta {
+      id: fmt_id((h, tx)),
+      height: h,
+      tx_index: tx,
+      txid: format!("{h:064x}"),
+      inscription_id: format!("{:064x}i0", h),
+      content_type: "application/wasm".into(),
+      code_hash: hash.into(),
+      code_len: 8,
+      time: 0,
+      program: program.map(str::to_string),
+      deployer: None,
+    }
+  }
+
+  /// Paging walks the code tree and only keeps the requested slice, including when prints are omitted.
+  #[test]
+  fn contracts_page_skips_then_takes() {
+    let db = store::Db::temporary().unwrap();
+    let t = Trees::open(&db).unwrap();
+    let hash = "00".repeat(32);
+    // five factories (10:0 .. 14:0) and two prints under the last one; ids increase so reverse order is newest first
+    for h in 10u64..15 {
+      t.t[T_CODE as usize].insert(id_key((h, 0)), serde_json::to_vec(&meta_at(h, 0, None, &hash)).unwrap()).unwrap();
+    }
+    t.t[T_CODE as usize].insert(id_key((14, 1)), serde_json::to_vec(&meta_at(14, 1, Some("14:0"), &hash)).unwrap()).unwrap();
+    t.t[T_CODE as usize].insert(id_key((14, 2)), serde_json::to_vec(&meta_at(14, 2, Some("14:0"), &hash)).unwrap()).unwrap();
+    let (page, total) = page_contract_metas(&t, 0, 2, false).unwrap();
+    assert_eq!(total, 5, "prints are not counted when omitted");
+    assert_eq!(page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["14:0", "13:0"]);
+    let (page, total) = page_contract_metas(&t, 4, 2, false).unwrap();
+    assert_eq!(total, 5);
+    assert_eq!(page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["10:0"]);
+    let (page, total) = page_contract_metas(&t, 0, 10, true).unwrap();
+    assert_eq!(total, 7);
+    assert_eq!(page[0].id, "14:2");
+  }
+
+  /// A print program's once-per-sender flag is the 0x15‖sender key, not a slice of recent txs.
+  #[test]
+  fn print_claimed_reads_the_sender_key() {
+    let db = store::Db::temporary().unwrap();
+    let t = Trees::open(&db).unwrap();
+    let hash = "7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694";
+    let program = (1000u64, 7u32);
+    t.t[T_CODE as usize].insert(id_key(program), serde_json::to_vec(&meta_at(1000, 7, None, hash)).unwrap()).unwrap();
+    let a = [7u8; 20];
+    let b = [8u8; 20];
+    t.t[T_STORAGE as usize].insert(storage_key(program, &[&[0x15u8][..], &a[..]].concat()), vec![0x01]).unwrap();
+    assert_eq!(sender_claimed_in(&t, None, program, a).unwrap(), Some(true));
+    assert_eq!(sender_claimed_in(&t, None, program, b).unwrap(), Some(false));
+    assert_eq!(sender_claimed_in(&t, None, (9, 9), a).unwrap(), None);
+  }
+}
