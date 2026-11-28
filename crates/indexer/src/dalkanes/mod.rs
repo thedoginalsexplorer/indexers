@@ -1407,6 +1407,144 @@ pub fn dalk_contracts(config: &Config, offset: usize, limit: usize, prints: bool
   Ok((out, total))
 }
 
+/// The kinds that are print programs (§20, §21, §23): their opcode 77 births a print.
+const PRINT_KINDS: [&str; 3] = ["proof", "shibkane", "doge"];
+
+/// How a list groups an inscribed id: `print` (born by a pull, §20), `collection` (a print program),
+/// `token` (answers the name, symbol and supply views, §13) or `other`. Read-only; no consensus effect.
+pub fn contract_class(s: &ContractSummary) -> &'static str {
+  if s.meta.program.is_some() {
+    return "print";
+  }
+  if s.kind.as_deref().is_some_and(|k| PRINT_KINDS.contains(&k)) {
+    return "collection";
+  }
+  if s.kind.as_deref() == Some("amm") {
+    return "other";
+  }
+  if s.token.name.is_some() && s.token.symbol.is_some() && s.token.supply.is_some() {
+    return "token";
+  }
+  "other"
+}
+
+/// Whether `meta` can be of `class` before its views are read: prints and collections are known from
+/// the record alone, tokens and others need the views (and are never prints or collections).
+fn meta_may_be(meta: &DeployMeta, class: &str) -> bool {
+  let collection = meta.program.is_none() && canon_of(&meta.code_hash).is_some_and(|c| PRINT_KINDS.contains(&c.0));
+  match class {
+    "print" => meta.program.is_some(),
+    "collection" => collection,
+    _ => meta.program.is_none() && !collection,
+  }
+}
+
+/// A filtered page of contracts, newest first: `class` (see `contract_class`) and `q` (a case-blind
+/// match on the id, name, symbol or label). Prints match only on their id, so a filter never reads the
+/// views of every print. At most `scan` records are summarised, which keeps a query bounded.
+pub fn dalk_contracts_filtered(config: &Config, class: Option<&str>, q: Option<&str>, offset: usize, limit: usize, scan: usize) -> Result<(Vec<ContractSummary>, usize)> {
+  let t = read_trees(config)?;
+  let height = load_state(&t.meta)?.next_height.saturating_sub(1);
+  let q = q.map(|x| x.trim().to_lowercase()).filter(|x| !x.is_empty());
+  let mut metas = Vec::new();
+  t.t[T_CODE as usize].for_each_rev_from(b"", |_, v| {
+    let m = serde_json::from_slice::<DeployMeta>(v)?;
+    let keep = match class {
+      Some(c) => meta_may_be(&m, c),
+      // a search with no class looks at contracts, not at every print
+      None => m.program.is_none() || q.as_deref().is_some_and(|q| m.id.contains(q)),
+    };
+    if keep {
+      metas.push(m);
+    }
+    Ok(metas.len() < scan)
+  })?;
+  let mut out = Vec::new();
+  let mut total = 0usize;
+  for m in metas {
+    if m.program.is_some() {
+      if q.as_deref().is_some_and(|q| !m.id.contains(q)) {
+        continue;
+      }
+      if total >= offset && out.len() < limit {
+        out.push(summary(config, &t, m, height)?);
+      }
+      total += 1;
+      continue;
+    }
+    let s = summary(config, &t, m, height)?;
+    if class.is_some_and(|c| contract_class(&s) != c) {
+      continue;
+    }
+    if let Some(q) = q.as_deref() {
+      let hit = s.meta.id.contains(q)
+        || [s.token.name.as_deref(), s.token.symbol.as_deref(), s.label.as_deref()].into_iter().flatten().any(|x| x.to_lowercase().contains(q));
+      if !hit {
+        continue;
+      }
+    }
+    if total >= offset && out.len() < limit {
+      out.push(s);
+    }
+    total += 1;
+  }
+  Ok((out, total))
+}
+
+/// Whether `id` is an inscribed contract or a print (§4.3, §20).
+pub fn dalk_known(config: &Config, id: Id) -> Result<bool> {
+  let t = read_trees(config)?;
+  Ok(t.get(T_CODE, &id_key(id))?.is_some())
+}
+
+/// One print of a collection (§20.1): its id, its number in the collection, and the address and
+/// output that hold its one unit now (none once it is burned).
+#[derive(Debug, Clone, Serialize)]
+pub struct PrintRow {
+  pub id: String,
+  pub index: u64,
+  pub owner: Option<String>,
+  pub outpoint: Option<String>,
+}
+
+/// A page of a print program's prints, in birth order, and how many it has born. `None` if `id` is
+/// not a print program.
+pub fn dalk_prints(config: &Config, id: Id, offset: usize, limit: usize) -> Result<Option<(Vec<PrintRow>, u64)>> {
+  let t = read_trees(config)?;
+  let Some(raw) = t.get(T_CODE, &id_key(id))? else { return Ok(None) };
+  let meta: DeployMeta = serde_json::from_slice(&raw)?;
+  if !meta_may_be(&meta, "collection") {
+    return Ok(None);
+  }
+  let st = |key: &[u8]| -> Result<Option<Vec<u8>>> { t.get(T_STORAGE, &storage_key(id, key)) };
+  let count = st(&[0x10])?.map(|v| u64_le(&v)).unwrap_or(0).min(PROOF_CAP);
+  let mut out = Vec::new();
+  for n in (offset as u64)..count.min(offset as u64 + limit as u64) {
+    let mut k = vec![0x11];
+    k.extend_from_slice(&(n as u32).to_le_bytes());
+    let Some(v) = st(&k)? else { continue };
+    if v.len() < 16 {
+      continue;
+    }
+    let pid = (u64_le(&v[..8]), u64_le(&v[8..16]) as u32);
+    let mut prefix = b"h|".to_vec();
+    prefix.extend_from_slice(&id_key(pid));
+    let mut held: Option<(String, String)> = None;
+    t.t[T_IDX as usize].for_each_prefix(&prefix, |k, v| {
+      if u128_of(v) == 0 {
+        return Ok(true);
+      }
+      let rest = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
+      if let Some((a, op)) = rest.split_once('|') {
+        held = Some((a.to_string(), op.to_string()));
+      }
+      Ok(false)
+    })?;
+    out.push(PrintRow { id: fmt_id(pid), index: n, owner: held.as_ref().map(|h| h.0.clone()), outpoint: held.map(|h| h.1) });
+  }
+  Ok(Some((out, count)))
+}
+
 /// Whether `sender` has already taken this contract's once-per-address claim. Print programs use key
 /// `0x15 ‖ sender` (§20.1). Other builds try opcode 106 (Howl, §18) and, if that is not a yes/no
 /// view, any successful receipt from this sender. `None` if the id is not a contract.
@@ -1790,6 +1928,48 @@ pub fn dalk_code(config: &Config, id: Id) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn meta_of(hash: &str, program: Option<&str>) -> DeployMeta {
+    DeployMeta {
+      id: "6475242:19".into(),
+      height: 6475242,
+      tx_index: 19,
+      txid: String::new(),
+      inscription_id: String::new(),
+      content_type: "application/wasm".into(),
+      code_hash: hash.into(),
+      code_len: 0,
+      time: 0,
+      program: program.map(str::to_string),
+      deployer: None,
+    }
+  }
+
+  #[test]
+  fn classes_for_lists() {
+    let proof = "7c9b14ca1babaf1ee229f26a49b89e8d54e7ad86af6adc228492e273ec9e1694";
+    let tok = |name: Option<&str>| TokenInfo { name: name.map(str::to_string), symbol: name.map(str::to_string), supply: name.map(|_| "1".to_string()), ..Default::default() };
+    let sum = |meta: DeployMeta, kind: Option<&str>, token: TokenInfo| ContractSummary {
+      meta,
+      kind: kind.map(str::to_string),
+      label: None,
+      token,
+      calls: 0,
+      holders: 0,
+      circulating: "0".into(),
+      card: None,
+    };
+    assert_eq!(contract_class(&sum(meta_of(proof, None), Some("proof"), tok(Some("Proof")))), "collection");
+    assert_eq!(contract_class(&sum(meta_of(proof, Some("6475242:19")), Some("proof"), tok(Some("Proof")))), "print");
+    assert_eq!(contract_class(&sum(meta_of("00", None), None, tok(Some("DogePay")))), "token");
+    assert_eq!(contract_class(&sum(meta_of("00", None), None, tok(None))), "other");
+    assert_eq!(contract_class(&sum(meta_of("00", None), Some("amm"), tok(Some("LP")))), "other");
+    assert!(meta_may_be(&meta_of(proof, None), "collection"));
+    assert!(!meta_may_be(&meta_of(proof, None), "token"));
+    assert!(meta_may_be(&meta_of(proof, Some("6475242:19")), "print"));
+    assert!(!meta_may_be(&meta_of("00", None), "print"));
+    assert!(meta_may_be(&meta_of("00", None), "token"));
+  }
 
   #[test]
   fn address_encoding() {
