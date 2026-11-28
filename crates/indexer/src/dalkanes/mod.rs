@@ -56,6 +56,9 @@ const CANON: &[(&str, &str, &str)] = &[
   ("b69f0aa9b8cd66335d1c08fa6c86d3af7d6b0def30c8d8688eff6ebefe9c71a4", "shibkane", "Shibkane"),
   ("aeafccfee33779532d930b86bfbd2fbb0e5519db072dc26e29888e3c4040a4c4", "doge", "Doge Orbital"),
   ("ee4c6e7ba6096c1ed5908485135a107f793f8295c2baa0c6e4734a8c9e16a3dd", "kibble", "Kibble"),
+  // §17 fair-launch: official dogex launch/build for DogePay / DPAY, cap 21,000,000, 10,000 per mint.
+  // Hash is SHA-256 of the wasm after the \0ALK\x01 header (same method as the §24 table).
+  ("9a4e2f5e047393f4896436896fefc72531f50f8aa38f0bd32c59b7bf01eb70d8", "launch", "DogePay"),
   // builds with baked ids, as deployed on mainnet (Collar: Howl, Ash, Vigil; Bone: Howl)
   ("66c3610d07e8f2fee6db975f52fe41c74bae826847cbc446146ae42334b315c0", "collar", "Collar"),
   ("cbb467a319b130e53724de61aba4eb32f2d33ebe2d28b4fcf3a182f79f8d808e", "bone", "Bone"),
@@ -2048,6 +2051,11 @@ mod tests {
     index_block(&db, &t, h0, &block(h0, txs), &HashMap::new(), &st).unwrap();
     let meta: DeployMeta = serde_json::from_slice(&t.get(T_CODE, &id_key((h0, 1))).unwrap().unwrap()).unwrap();
     assert_eq!(canon_of(&meta.code_hash).map(|c| c.0), Some("proof"));
+    assert_eq!(
+      canon_of("9a4e2f5e047393f4896436896fefc72531f50f8aa38f0bd32c59b7bf01eb70d8").map(|c| c.0),
+      Some("launch")
+    );
+
 
     let k1 = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
     let k2 = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
