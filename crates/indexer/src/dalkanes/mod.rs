@@ -465,8 +465,8 @@ const PROOF_CAP: u64 = 420;
 /// This follows jonheaven's 2026-11-27 note: the block lock came from Howl and Kibble and is wrong for a
 /// drop (Bitcoin's Orbital draft lets several children be born in one block). The 420 cap and one pull
 /// per address stay. Blocks below this keep the old rule, so the prints already born (#0–#3) and the
-/// pulls refused in old blocks (e.g. 6475541 tx 31) stay as they are, and nothing replays. Spec 0.4.2
-/// still lists the block lock; this height is ours until the spec names one.
+/// pulls refused in old blocks (e.g. 6475541 tx 31) stay as they are, and nothing replays. Spec 0.4.3
+/// names this height: "from height 6,475,700 on, this check is not made."
 pub const PRINT_BLOCK_LOCK_END: u64 = 6_475_700;
 
 /// §20.1: why a pull at `height` from `sender` is refused before execution, if it is: the collection
@@ -1666,14 +1666,14 @@ impl StateView for SimView {
 /// before it signs. `sender` is the verified sender's 20-byte hash, `value` the koinu the carrier
 /// would burn. Nothing is written. Opcode 77 on an inscribed Proof or Shibkane program runs as the
 /// block does (§20): a Proof's gate first, then the program as the new id with the program as caller.
-pub fn dalk_simulate(config: &Config, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>) -> Result<SimOutcome> {
+pub fn dalk_simulate(config: &Config, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>, fuel: Option<u64>) -> Result<SimOutcome> {
   let db = ii::db_of(config)?;
   let meta = load_state(&db.open_tree("meta")?)?;
   let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-  simulate_at(&db, meta.next_height, now, target, inputs, value, sender)
+  simulate_at(&db, meta.next_height, now, target, inputs, value, sender, fuel)
 }
 
-fn simulate_at(db: &store::Db, height: u64, time: u64, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>) -> Result<SimOutcome> {
+fn simulate_at(db: &store::Db, height: u64, time: u64, target: Id, inputs: &[u128], value: u64, sender: Option<[u8; 20]>, fuel: Option<u64>) -> Result<SimOutcome> {
   let base = DbView { wasm: db.open_tree("dalk_wasm")?, storage: db.open_tree("dalk_storage")?, ledger: db.open_tree("dalk_ledger")? };
   let tx = 1u32;
   let mut birth: Option<(Id, Rc<Vec<u8>>)> = None;
@@ -1697,7 +1697,7 @@ fn simulate_at(db: &store::Db, height: u64, time: u64, target: Id, inputs: &[u12
     tx,
     time,
     target: born.unwrap_or(target),
-    fuel: vm::MAX_FUEL,
+    fuel: fuel.filter(|&f| f > 0).unwrap_or(vm::MAX_FUEL).min(vm::MAX_FUEL),
     calldata: vm::calldata(inputs),
     value,
     sender,
@@ -2042,18 +2042,18 @@ mod tests {
     // the dry run a wallet asks before a pull (§20): the gate, then the birth as the next block's id
     let k2h = sig::hash160(&secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &k2).serialize());
     let next = h0 + 3;
-    let sim = simulate_at(&db, next, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
+    let sim = simulate_at(&db, next, 0, program, &[77, 1], 0, Some(k2h), None).unwrap();
     assert!(sim.result.ok, "{:?}", sim.result.error);
     assert_eq!(sim.born, Some((next, 1)));
     assert_eq!(sim.result.outgoing, vec![((next, 1), 1, 1)]);
     // k1 already pulled: refused before execution, no id, no fuel
-    let sim = simulate_at(&db, next, 0, program, &[77, 1], 0, Some(k1h)).unwrap();
+    let sim = simulate_at(&db, next, 0, program, &[77, 1], 0, Some(k1h), None).unwrap();
     assert_eq!((sim.result.ok, sim.result.fuel_used, sim.result.error.as_deref(), sim.born), (false, 0, Some("this address already pulled"), None));
     // the block that last pulled is refused too
-    let sim = simulate_at(&db, h0 + 1, 0, program, &[77, 1], 0, Some(k2h)).unwrap();
+    let sim = simulate_at(&db, h0 + 1, 0, program, &[77, 1], 0, Some(k2h), None).unwrap();
     assert_eq!(sim.result.error.as_deref(), Some("this block already pulled"));
     // 77 on a print is not a birth
-    let sim = simulate_at(&db, next, 0, (h0 + 1, 1), &[77, 1], 0, Some(k2h)).unwrap();
+    let sim = simulate_at(&db, next, 0, (h0 + 1, 1), &[77, 1], 0, Some(k2h), None).unwrap();
     assert!(!sim.result.ok && sim.born.is_none());
   }
 
@@ -2092,7 +2092,7 @@ mod tests {
       assert!(!matches!(rc.error.as_deref(), Some("this address already pulled" | "this block already pulled" | "the collection is full")), "{rc:?}");
     }
     assert!(t.get(T_CODE, &id_key((h0 + 1, 1))).unwrap().is_none());
-    let sim = simulate_at(&db, h0 + 3, 0, program, &[77, 1], 0, None).unwrap();
+    let sim = simulate_at(&db, h0 + 3, 0, program, &[77, 1], 0, None, None).unwrap();
     assert!(sim.born.is_none());
   }
 
@@ -2141,7 +2141,7 @@ mod tests {
     assert_eq!((r[1].ok, r[1].fuel_used, r[1].error.as_deref(), r[1].born.is_none()), (false, 0, Some("this block already pulled"), true));
     assert_eq!(count(), Some(1));
     // the dry run in that block says the same; from `end` it does not
-    assert_eq!(simulate_at(&db, end - 1, 0, program, &[77, 1], 0, Some(h160(&key(22)))).unwrap().result.error.as_deref(), Some("this block already pulled"));
+    assert_eq!(simulate_at(&db, end - 1, 0, program, &[77, 1], 0, Some(h160(&key(22))), None).unwrap().result.error.as_deref(), Some("this block already pulled"));
     // from `end`: two pulls in one block both birth, indexes 1 and 2, in transaction order
     let r = block_of(end, &[key(22), key(23)], &mut st);
     assert_eq!(r[0].born.as_deref(), Some(fmt_id((end, 1)).as_str()), "{:?}", r[0]);
@@ -2153,7 +2153,7 @@ mod tests {
     child.extend_from_slice(&2u64.to_le_bytes());
     assert_eq!(slot(2), Some(child));
     // a fresh address in the block that just pulled: the dry run births it
-    let sim = simulate_at(&db, end, 0, program, &[77, 1], 0, Some(h160(&key(24)))).unwrap();
+    let sim = simulate_at(&db, end, 0, program, &[77, 1], 0, Some(h160(&key(24))), None).unwrap();
     assert!(sim.result.ok, "{:?}", sim.result.error);
     // one per address still holds, in a later block and within one block
     let r = block_of(end + 1, &[key(23), key(24), key(24)], &mut st);
@@ -2161,7 +2161,7 @@ mod tests {
     assert_eq!(r[1].born.as_deref(), Some(fmt_id((end + 1, 2)).as_str()), "{:?}", r[1]);
     assert_eq!(r[2].error.as_deref(), Some("this address already pulled"));
     assert_eq!(count(), Some(4));
-    assert_eq!(simulate_at(&db, end + 2, 0, program, &[77, 1], 0, Some(h160(&key(21)))).unwrap().result.error.as_deref(), Some("this address already pulled"));
+    assert_eq!(simulate_at(&db, end + 2, 0, program, &[77, 1], 0, Some(h160(&key(21))), None).unwrap().result.error.as_deref(), Some("this address already pulled"));
   }
 
   /// §20.1: the cap and the address hold at every height; the block lock only below PRINT_BLOCK_LOCK_END.
