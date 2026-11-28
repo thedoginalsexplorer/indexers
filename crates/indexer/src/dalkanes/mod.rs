@@ -1697,7 +1697,7 @@ fn simulate_at(db: &store::Db, height: u64, time: u64, target: Id, inputs: &[u12
     tx,
     time,
     target: born.unwrap_or(target),
-    fuel: fuel.filter(|&f| f > 0).unwrap_or(vm::MAX_FUEL).min(vm::MAX_FUEL),
+    fuel: fuel.unwrap_or(vm::MAX_FUEL).min(vm::MAX_FUEL).max(1),
     calldata: vm::calldata(inputs),
     value,
     sender,
